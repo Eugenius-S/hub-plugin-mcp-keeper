@@ -12,6 +12,9 @@ Every `every_minutes` (15) one pass, per server:
   2. the access has expired and there is a refresh token: Claude Code refreshes it itself, under its own lock - the
      plugin asks `claude mcp get <server>` (this server only, at most once an hour, never for a one-time login) with a
      time limit, the whole process tree is killed when it runs over, and the output is parsed in memory, never stored.
+The token goes only to https (http - only to localhost) and never through a redirect. The plugin never exchanges a
+refresh token itself, and keeps away from a refresh Claude Code is doing right now (its mcp-refresh-*.lock is fresh).
+Claude Code knows ~/.claude.json and plugins, not the hub catalog: "no such server" is not a verdict (the view shows it).
 Lost is only an explicit refusal (401/403, "needs authentication", an erased record, a token that cannot be refreshed).
 A timeout, no network, 5xx - "later", nothing is said. A pass runs only after COOLDOWN seconds of a live network
 without sleep (the wall clock jumping away from the monotonic one); a new loss is told only if a second pass
@@ -28,10 +31,10 @@ to the sessions that are working with this server right now, and the status in t
 The state files hold server names, states and times only - no command lines, arguments, headers or addresses.
 
 Settings - hub.json extensions[<plugin>]: every_minutes (15), warn_days (3), ignore ([names]), one_time ([names]),
-max_alarms (6 a day), ask_claude (true), check_duplicates (false), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
+max_alarms (6 a day), ask_claude (true), net_check_minutes (5), stale_days (2), check_duplicates (false), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
 timezone); hub.json mcp_auth_ignore is honoured too.
 """
-import datetime, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.request
+import datetime, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
 KEY = os.environ.get("HUB_EXTENSION") or "mcp-keeper"   # hub.json extensions key: <account>:mcp-keeper from the market
 NAME = KEY.split(":")[-1]                                # channel and fact name
@@ -51,7 +54,10 @@ GET_TIMEOUT = 90          # a `claude mcp get` run over this is killed, with eve
 KILL_GRACE = 3            # seconds between SIGTERM and SIGKILL of that tree
 COOLDOWN = 300            # a pass only after this many seconds of live network without sleep
 WAKE_JUMP = 60            # wall clock ran away from the monotonic one by more - the machine slept
-NET_STEP = 30
+NET_STEP = 30             # the loop looks at the clock this often (cheap: no network)
+NET_EVERY = 5             # minutes between TCP checks of the network in the idle loop (net_check_minutes)
+STALE_DAYS = 2            # an access expired this long that Claude Code cannot be asked about - shown in the view
+LOCK_FRESH = 300          # a refresh lock of Claude Code younger than this: someone is refreshing right now
 MAX_WAIT = 1800
 TRIES = 3
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
@@ -61,6 +67,8 @@ STATES = ("ok", "lost", "later")
 
 STR = {
     "en": {
+        "why_stale": "the access expired {days} days ago and Claude Code does not know this server - the hub's sessions "
+                     "refresh it when they use it",
         "title": "MCP logins",
         "lost_topic": "MCP login lost",
         "lost": "MCP login lost: {names} - log in:",
@@ -78,6 +86,8 @@ STR = {
         "status": "MCP: {ok} live, {bad} lost, {later} later",
     },
     "ru": {
+        "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает — хаб освежит его, когда сессия "
+                     "им воспользуется",
         "title": "Входы MCP",
         "lost_topic": "Слетел вход MCP",
         "lost": "Слетел вход MCP: {names} — войди:",
@@ -156,7 +166,10 @@ def settings():
     skip = cfg.get("mcp_auth_ignore")
     return {"every": max(1.0, float(own.get("every_minutes") or EVERY)) * 60,
             "warn_days": float(own.get("warn_days", 3)),
-            "one_time": {short(x) for x in own.get("one_time", ONE_TIME)},
+            # the built-in one-time servers cannot be switched off: a setting only adds to them
+            "one_time": {short(x) for x in list(ONE_TIME) + list(own.get("one_time") or [])},
+            "net_every": max(1.0, float(own.get("net_check_minutes") or NET_EVERY)) * 60,
+            "stale_days": max(0.0, float(own.get("stale_days", STALE_DAYS))),
             "quiet_until": parse_quiet(own.get("quiet_until"), cfg.get("timezone")),
             "max_alarms": max(1, int(own.get("max_alarms") or MAX_ALARMS)),
             "ask_claude": own.get("ask_claude", True) is not False,
@@ -278,6 +291,16 @@ def run_limited(cmd, timeout):
     return proc.returncode, text_of(out)
 
 
+def get_url(text):
+    m = re.search(r"^\s*url:\s*(\S+)", text or "", re.I | re.M)
+    return m.group(1) if m else None
+
+
+def same_server(a, b):
+    """The address Claude Code shows and the catalog address are one server (query and trailing slash aside)."""
+    return fingerprint({"url": a}) == fingerprint({"url": b}) if a and b else True
+
+
 def mcp_get(name):
     """(code, text) of `claude mcp get <name>` - one server, never the whole list (that starts every stdio server);
     None - no claude. Claude Code refreshes an expired OAuth access of this server itself, under its own lock."""
@@ -290,8 +313,10 @@ def mcp_get(name):
 def parse_get(text):
     """`claude mcp get` -> connected | auth | failed | None (no such server, no answer)."""
     low = (text or "").lower()
-    if not low.strip() or "no mcp server" in low:
+    if not low.strip():
         return None
+    if "no mcp server" in low:
+        return "unknown"   # the CLI knows ~/.claude.json and plugins, not the hub catalog (sessions run --strict-mcp-config)
     m = re.search(r"status:\s*(.+)", low)
     status = m.group(1) if m else low
     # "! Connected - tools fetch failed - Request timed out": the login was taken, only the tool list was slow (load
@@ -408,11 +433,33 @@ def duplicates():
 
 # ───── network ─────
 
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "[::1]")
+
+
+def safe_url(url):
+    """The token goes only to https (http - only to the machine itself), never to an address with a login in it."""
+    try:
+        p = urllib.parse.urlsplit(str(url).strip())
+        host = p.hostname or ""
+    except ValueError:
+        return False
+    if p.username or p.password or not host:
+        return False
+    return p.scheme == "https" or (p.scheme == "http" and host in LOCAL_HOSTS)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the Authorization header to another place: not followed, the 3xx answer is the result."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def probe(ent):
-    """Does the server take the access of the entry: True / False (401, 403) / None (cannot tell: no network, 5xx, no
-    address or token). The token and the body go nowhere."""
+    """Does the server take the access of the entry: True / False (401, 403) / None (cannot tell: no network, 5xx, a
+    redirect, an unsafe address, no address or token). The token and the body go nowhere."""
     url, token = ent.get("serverUrl"), ent.get("accessToken")
-    if not url or not token:
+    if not url or not token or not safe_url(url):
         return None, None
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
@@ -420,11 +467,14 @@ def probe(ent):
     head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": UA,
             "Authorization": "Bearer " + token}
     # a proxy with an https:// scheme breaks urllib - the second try goes direct
-    for opener in (urllib.request.build_opener(), urllib.request.build_opener(urllib.request.ProxyHandler({}))):
+    for opener in (urllib.request.build_opener(NoRedirect), urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))):
         try:
             with opener.open(urllib.request.Request(url, data=body, headers=head), timeout=30) as r:
-                return (True if r.status < 500 else None), r.status
+                return (True if r.status < 300 else None), r.status
         except urllib.error.HTTPError as e:
+            e.close()
+            if 300 <= e.code < 400:   # moved: nobody judged the login
+                return None, e.code
             return (False if e.code in (401, 403) else True if e.code < 500 else None), e.code
         except Exception:   # noqa: BLE001 - network: once more without the proxy, then "cannot tell"
             continue
@@ -455,11 +505,14 @@ class Calm:
     def __init__(self):
         self.mark, self.shaken, self.down = drift(), mono(), False
 
-    def look(self):
+    def look(self, net=True):
+        """net=False - only the clock (a sleep), no TCP: the idle loop does that every step, the network - rarely."""
         d = drift()
         if d - self.mark > WAKE_JUMP:
             self.shaken = mono()
         self.mark = d
+        if not net:
+            return
         if not net_up():
             self.down, self.shaken = True, mono()
         elif self.down:
@@ -550,15 +603,32 @@ def in_use(st):
     return out
 
 
-def verdict_of(name):
-    """connected | auth | later from one `claude mcp get <name>`."""
+def verdict_of(name, url=None):
+    """connected | auth | unknown | later from one `claude mcp get <name>`. unknown - Claude Code has no such server (the
+    hub catalog is not ~/.claude.json) or the name there is another server (another address): its answer says nothing."""
     r = mcp_get(name)
     if not isinstance(r, tuple) or r[0] == 124:
         return "later"
-    return {"connected": "connected", "auth": "auth"}.get(parse_get(r[1]), "later")
+    said = parse_get(r[1])
+    if said in ("connected", "auth", "failed") and not same_server(get_url(r[1]), url):
+        return "unknown"
+    return {"connected": "connected", "auth": "auth", "unknown": "unknown"}.get(said, "later")
 
 
-def ask(name, ent, now, st, conf):
+def refresh_busy(now):
+    """Claude Code refreshes an MCP login under ~/.claude/mcp-refresh-<key>.lock: while one is fresh somebody is in the
+    middle of an exchange - the plugin does not start a second Claude Code next to it (a kill or a repeat of a one-time
+    refresh loses the login)."""
+    for p in glob.glob(os.path.join(glob.escape(claude_dir()), "mcp-refresh-*.lock")):
+        try:
+            if now - os.path.getmtime(p) < LOCK_FRESH:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def ask(name, ent, now, st, conf, url=None):
     """What Claude Code says about this one server (it refreshes an expired OAuth access itself, under its own lock).
     Not for a one-time login (a run killed in the middle of the exchange loses it), not when switched off. One run
     asks again a minute later if it says "needs authentication"; the answer is kept for an hour while the stored login
@@ -569,10 +639,12 @@ def ask(name, ent, now, st, conf):
     exp = ent.get("expiresAt") or 0
     if isinstance(rec, dict) and now - rec.get("at", 0) < ASK_EVERY and rec.get("exp") == exp:
         return rec.get("verdict") or "later"
-    verdict = verdict_of(name)
+    if refresh_busy(now):
+        return "later"
+    verdict = verdict_of(name, url)
     if verdict == "auth":
         time.sleep(RECHECK)
-        verdict = verdict_of(name)
+        verdict = verdict_of(name, url)
     st["asked"][name] = {"at": now, "exp": exp, "verdict": verdict}
     return verdict
 
@@ -597,14 +669,19 @@ def checkup(conf, now, st, hub, hub_st):
         expires = (ent.get("expiresAt") or 0) / 1000
         row = {"state": "later"}
         if ent.get("accessToken") and (not expires or expires > now + 60):
-            ok, code = probe({**ent, "serverUrl": ent.get("serverUrl") or url})
+            # the stored login of another address (a name that two servers share) never gets sent to this one
+            ok, code = probe({**ent, "serverUrl": ent.get("serverUrl") or url}) if same_server(ent.get("serverUrl"), url) \
+                else (None, None)
             if ok is False:
                 row = lose(tr("why_rejected", code=code))
             elif ok:
                 row = {"state": "ok"}
         elif ent.get("refreshToken"):
-            said = ask(name, ent, now, st, conf)
+            said = ask(name, ent, now, st, conf, url)
             row = lose(tr("why_auth")) if said == "auth" else {"state": "ok"} if said == "connected" else row
+            days = (now - expires) / DAY if expires else 0
+            if said == "unknown" and conf["stale_days"] and days >= conf["stale_days"]:
+                row = {"state": "later", "why": tr("why_stale", days=int(days))}
         else:
             row = lose(tr("why_expired"))
         if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
@@ -925,10 +1002,14 @@ def loop():
         time.sleep(START_DELAY)
         report(once())
     while True:
-        wake = time.time() + settings()["every"]
+        conf = settings()
+        wake, net_at = time.time() + conf["every"], mono()
         while time.time() < wake:   # sleep of the machine: go by the clock, not by a counter
             time.sleep(min(NET_STEP, max(1, wake - time.time())))
-            CALM.look()
+            due = mono() - net_at >= conf["net_every"]   # TCP to the outside - not every step
+            CALM.look(net=due)
+            if due:
+                net_at = mono()
         report(once())
 
 

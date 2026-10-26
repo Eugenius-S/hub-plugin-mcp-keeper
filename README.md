@@ -17,17 +17,25 @@ servers **the hub gives to its sessions** and says so once, before a session get
 ## One pass
 
 1. The stored access token (Claude Code credentials: the macOS keychain item or `.credentials.json`, read only, never
-   written) goes in an `initialize` request to the server's own address. 401/403 - the login is rejected.
+   written) goes in an `initialize` request to the server's own address. 401/403 - the login is rejected. The token
+   goes only to https (http - only to localhost / 127.0.0.1), never to an address with a login in it, never to an
+   address other than the one the login was stored for, and a redirect is not followed (the Authorization header
+   would travel with it): a 3xx answer is "later".
 2. The access has expired and a refresh token exists: Claude Code refreshes it itself, under its own lock. The plugin asks
    `claude mcp get <server>` - this one server, at most once an hour while the stored login does not change, never for
-   a one-time login (`one_time`, default `canva`: a run killed in the middle of the exchange loses it). If you prefer
-   that the plugin never runs `claude`, set `ask_claude` to `false`: such a server is "later".
+   a one-time login (`one_time`, always includes `canva`, a setting only adds to it: a run killed in the middle of the
+   exchange loses it) and not while a `~/.claude/mcp-refresh-*.lock` of Claude Code is fresh (somebody is exchanging
+   right now). The plugin never exchanges a refresh token itself - only Claude Code does, under that lock. If you
+   prefer that the plugin never runs `claude`, set `ask_claude` to `false`: such a server is "later".
+   `claude mcp get` knows `~/.claude.json` and plugins, not the hub catalog (hub sessions run with
+   `--strict-mcp-config`): "No MCP server named ..." or an answer for another address says nothing about the login.
+   Such a server stays "later"; once its access has been expired for `stale_days` the view says so.
 3. `claude mcp get` runs with a time limit (90 s). When it runs over, the whole process tree is killed (the process
    group on macOS/Linux, `taskkill /T` on Windows) - no orphans, no hung `claude`.
 
 Lost is only an explicit refusal (401/403, "needs authentication" twice, an erased record, an expired token without a
 refresh token). A timeout, no network, a 5xx - "check later", nothing is said. A pass runs only after 5 minutes of a live
-network without sleep, and a new loss is told only if a second pass 5 minutes later sees it too.
+network without sleep (the idle loop looks at the clock every 30 s, at the network every `net_check_minutes`), and a new loss is told only if a second pass 5 minutes later sees it too.
 
 ## Alarms
 
@@ -62,7 +70,9 @@ output, command lines, free-form status rows) are removed or rewritten at start.
 |---|---|---|
 | `every_minutes` | 15 | minutes between passes |
 | `ignore` | `[]` | server names not to check (`hub.json` `mcp_auth_ignore` counts too) |
-| `one_time` | `["canva"]` | servers whose refresh token works once: `claude` is never run for them |
+| `one_time` | `[]` | servers to add to the built-in one-time `canva`: `claude` is never run for them |
+| `net_check_minutes` | 5 | minutes between TCP checks of the network in the idle loop |
+| `stale_days` | 2 | an access this long expired on a server Claude Code does not know - the view says so (0 - off) |
 | `warn_days` | 3 | a login without a refresh token - warn this many days before it expires |
 | `max_alarms` | 6 | messages to the owner a day, the whole plugin |
 | `ask_claude` | `true` | `false` - never run `claude mcp get`, an expired access is "later" |

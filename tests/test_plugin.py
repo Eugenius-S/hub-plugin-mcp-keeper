@@ -1,5 +1,5 @@
 """mcp-keeper: no real claude, network or keychain - a fake `claude` script, a credentials file and patched probes."""
-import json, os, signal, stat, subprocess, sys, tempfile, time, unittest
+import http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT)
 import main  # noqa: E402
 
 REAL_GET, REAL_PROCESSES, REAL_SLEEP = getattr(main, "mcp_get", None), main.processes, time.sleep   # before any patch
+REAL_PROBE = main.probe
 
 NOW = 2_000_000_000.0
 
@@ -127,7 +128,7 @@ class Parse(Base):
         self.assertEqual(main.parse_get(G_AUTH), "auth")
         self.assertEqual(main.parse_get(G_FAIL), "failed")
         self.assertEqual(main.parse_get("! Connected · tools fetch failed — Request timed out"), "connected")
-        self.assertIsNone(main.parse_get("No MCP server found with name: figma"))
+        self.assertEqual(main.parse_get("No MCP server named \"figma\". Configured servers: a"), "unknown")
         self.assertIsNone(main.parse_get(""))
 
 
@@ -484,6 +485,232 @@ class Secrets(Base):
                                  "servers": {"a": {"state": "ok", "ok_at": 2, "args": ["--token", "x"], "url": "https://u?k=1"},
                                              "b": {"state": "weird"}, "c": "text"}})
         self.assertEqual(got["servers"], {"a": {"state": "ok", "ok_at": 2}})
+
+
+class Token(Base):
+    """The access token goes only to https (http - only to this machine) and is never carried through a redirect."""
+
+    def serve(self, handler):
+        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv
+
+    def test_url_rules(self):
+        for ok in ("https://mcp.example.com/mcp", "http://127.0.0.1:8000/mcp", "http://localhost/mcp", "http://[::1]:1/x"):
+            self.assertTrue(main.safe_url(ok), ok)
+        for bad in ("http://mcp.example.com/mcp", "ftp://x/y", "https://user:pw@mcp.example.com/", "https:///x", "",
+                    "http://127.0.0.1.evil.com/mcp", "file:///etc/passwd"):
+            self.assertFalse(main.safe_url(bad), bad)
+
+    def test_plain_http_to_a_foreign_host_sends_nothing(self):
+        with mock.patch.object(main.urllib.request.OpenerDirector, "open", side_effect=AssertionError("sent")):
+            self.assertEqual(REAL_PROBE({"serverUrl": "http://mcp.example.com/mcp", "accessToken": "secret"}), (None, None))
+
+    def test_http_to_localhost_is_sent(self):
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = self.serve(H)
+        got = REAL_PROBE({"serverUrl": f"http://127.0.0.1:{srv.server_port}/mcp", "accessToken": "secret"})
+        self.assertEqual(got, (True, 200))
+        self.assertEqual(seen, ["Bearer secret"])
+
+    def test_redirect_is_not_followed_and_the_token_does_not_travel(self):
+        seen = []
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            do_GET = do_POST
+
+            def log_message(self, *a):
+                pass
+
+        target = self.serve(Target)
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/steal")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        front = self.serve(Redirect)
+        got = REAL_PROBE({"serverUrl": f"http://127.0.0.1:{front.server_port}/mcp", "accessToken": "secret"})
+        self.assertEqual(got, (None, 307), "a redirect is no verdict about the login")
+        self.assertEqual(seen, [], "the second address got nothing")
+
+    def test_login_of_another_address_is_not_sent(self):
+        self.creds(figma={"serverUrl": "https://other.example.com/mcp", "accessToken": "t", "refreshToken": "r",
+                          "expiresAt": (NOW + 3600) * 1000})
+        with mock.patch.object(main, "probe", side_effect=AssertionError("sent")):
+            res = main.checkup(main.settings(), NOW, {}, "hub", self.hub)
+        self.assertEqual(res["servers"]["figma"]["state"], "later")
+
+
+class Unknown(Base):
+    """Catalog servers are not in ~/.claude.json: `claude mcp get` does not know them - that is not a verdict."""
+
+    def expire(self, *names):
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        for n in names:
+            recs["mcpOAuth"][n + "|abc"]["expiresAt"] = (NOW - 60) * 1000
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+
+    def test_unknown_to_claude_is_later_not_ok_not_lost(self):
+        self.expire("figma")
+        self.gets["figma"] = 'No MCP server named "figma". Configured servers: github'
+        res = self.run_once()
+        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertEqual(self.notes(), [])
+
+    def test_a_name_of_another_server_is_no_answer(self):
+        self.expire("figma")
+        self.gets["figma"] = "figma:\n  Status: \u2713 Connected\n  Type: http\n  URL: https://elsewhere.example.com/mcp\n"
+        res = self.run_once()
+        self.assertEqual(res["servers"]["figma"]["state"], "later")
+
+    def test_same_address_answer_counts(self):
+        self.expire("figma")
+        self.gets["figma"] = "figma:\n  Status: \u2713 Connected\n  URL: https://mcp.figma.com/mcp/\n"
+        self.assertEqual(self.run_once()["servers"]["figma"]["state"], "ok")
+
+    def test_long_expired_unknown_shows_why_in_the_view(self):
+        self.expire("figma")
+        self.gets["figma"] = "No MCP server named figma"
+        res = self.run_once(NOW + 3 * 86400)
+        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertIn("3 days", res["servers"]["figma"]["why"])
+        self.assertEqual(self.notes(), [])
+        self.assertIn("days ago", read(os.environ["MCP_KEEPER_STATUS"])["servers"]["figma"]["why"])
+
+    def test_stale_days_zero_switches_it_off(self):
+        self.config({}, {"stale_days": 0})
+        self.expire("figma")
+        self.gets["figma"] = "No MCP server named figma"
+        self.assertNotIn("why", self.run_once(NOW + 9 * 86400)["servers"]["figma"])
+
+
+class Refresh(Base):
+    """The plugin never exchanges a refresh token itself and keeps away from a running exchange of Claude Code."""
+
+    def test_no_token_exchange_in_the_code(self):
+        with open(os.path.join(ROOT, "main.py"), encoding="utf-8") as f:
+            src = f.read()
+        for word in ("grant_type", "token_endpoint", "/oauth/token", "refresh_token="):
+            self.assertNotIn(word, src)
+
+    def test_refresh_token_value_is_never_sent(self):
+        sent = []
+
+        def spy(url, data=None, headers=None, **kw):
+            sent.append((data, headers))
+            raise OSError("no network")
+
+        Unknown.expire.__get__(self)("figma")
+        self.gets["figma"] = G_OK
+        with mock.patch.object(main.urllib.request, "Request", spy):
+            self.run_once()
+        self.assertEqual(sent, [])   # an expired access is asked of Claude Code, the plugin sends nothing
+
+    def test_one_time_defaults_cannot_be_switched_off(self):
+        self.config({}, {"one_time": []})
+        self.assertIn("canva", main.settings()["one_time"])
+        self.config({}, {"one_time": ["extra"]})
+        self.assertEqual(main.settings()["one_time"], {"canva", "extra"})
+
+    def test_one_time_stays_out_of_claude_with_empty_setting(self):
+        self.config({}, {"one_time": []})
+        Unknown.expire.__get__(self)("canva")
+        res = self.run_once()
+        self.assertNotIn("canva", self.asked)
+        self.assertEqual(res["servers"]["canva"]["state"], "later")
+
+    def lock(self, age):
+        path = os.path.join(TMP, "claude", "mcp-refresh-abc123.lock")
+        shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path)
+        os.utime(path, (NOW - age, NOW - age))
+        self.addCleanup(shutil.rmtree, path, True)
+
+    def test_running_exchange_of_claude_code_holds_the_question(self):
+        Unknown.expire.__get__(self)("figma")
+        self.lock(10)
+        res = self.run_once()
+        self.assertEqual(self.asked, [])
+        self.assertEqual(res["servers"]["figma"]["state"], "later")
+
+    def test_old_lock_does_not_hold(self):
+        Unknown.expire.__get__(self)("figma")
+        self.lock(2 * main.LOCK_FRESH)
+        self.run_once()
+        self.assertEqual(self.asked, ["figma"])
+
+
+class Net(Base):
+    """The TCP check of the network is rare in the idle loop; the sleep check (a clock) stays frequent."""
+
+    def test_look_without_net_makes_no_tcp(self):
+        calls = []
+        with mock.patch.object(main, "net_up", lambda: calls.append(1) or True):
+            main.CALM.look(net=False)
+            self.assertEqual(calls, [])
+            main.CALM.look()
+            self.assertEqual(calls, [1])
+
+    def test_sleep_is_still_seen_without_net(self):
+        main.CALM.shaken = self.clock - 10 * main.COOLDOWN
+        main.CALM.mark = 0.0
+        with mock.patch.object(main, "drift", lambda: 1000.0):
+            main.CALM.look(net=False)
+        self.assertEqual(main.CALM.shaken, self.clock)
+
+    def test_idle_loop_asks_the_network_every_net_check_minutes(self):
+        self.config({}, {"every_minutes": 15, "net_check_minutes": 5})
+        self.assertEqual(main.settings()["net_every"], 300)
+        self.assertEqual(main.settings()["every"], 900)
+        wall = [NOW]
+        net = []
+
+        def sleep(sec):
+            self.clock += sec
+            wall[0] += sec
+
+        class Stop(Exception):
+            pass
+
+        passes = []
+        def once():
+            passes.append(1)
+            if len(passes) > 1:
+                raise Stop
+            return {"servers": {}, "later_all": True}
+
+        with mock.patch.object(main.time, "sleep", sleep), mock.patch.object(main.time, "time", lambda: wall[0]), \
+                mock.patch.object(main, "net_up", lambda: net.append(1) or True), mock.patch.object(main, "once", once), \
+                mock.patch.object(main, "start_clean", lambda: None), mock.patch.object(main, "write_status", lambda s: None), \
+                mock.patch.object(main, "load_state", lambda: {"at": wall[0]}), mock.patch.object(main, "report", lambda r: None):
+            with self.assertRaises(Stop):
+                main.loop()
+        self.assertEqual(len(net), 6, "two rounds of 15 minutes: 6 TCP checks, not 60")
+
+    def test_default_is_five_minutes(self):
+        self.assertEqual(main.settings()["net_every"], main.NET_EVERY * 60)
 
 
 @unittest.skipIf(os.name == "nt", "process groups")

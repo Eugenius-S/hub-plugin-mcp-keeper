@@ -3,7 +3,7 @@
   "icon": "icon.png",
   "description": "MCP keeper: every 15 minutes checks the OAuth logins of the MCP servers the hub gives to its sessions (the hub catalog and plugin servers; remote servers only, no stdio server is ever started) and catches a lost login before work stops on it - one urgent message per server per day with the login command, a daily cap, a line to the sessions that use it; the view shows every server and when it was last live. Nothing but names, states and times is stored",
   "why": "A lost MCP login is found by the owner, not by a stuck session: the plugin notices it within 15 minutes and says how to log in, once",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "i18n": {
     "ru": {
       "description": "MCP-теребонька: раз в 15 минут проверяет входы OAuth тех MCP-серверов, которые хаб выдаёт сессиям (каталог хаба и плагины; только удалённые, stdio-серверы не запускаются) и ловит слетевший вход раньше, чем встанет работа: одно срочное сообщение на сервер в сутки с командой входа, суточный предел, строка сессиям, которые с ним работают; вид показывает все серверы и когда каждый был жив. Хранятся только имена, состояния и время",
