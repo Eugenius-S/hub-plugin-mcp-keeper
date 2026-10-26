@@ -1,0 +1,11 @@
+{
+  "name": "mcp-keeper",
+  "icon": "icon.png",
+  "description": "MCP keeper: every 15 minutes calls round every MCP server of Claude Code (user, project, plugins) and catches a lost login before work stops on it - one urgent message to the owner with the login command, repeated hourly while the server stays lost; sessions working with it get a line; the view shows every server and when it was last live",
+  "why": "A lost MCP login is found by the owner, not by a stuck session: the plugin notices it within 15 minutes and says how to log in",
+  "version": "0.1.0",
+  "i18n": {"ru": {"description": "MCP-теребонька: прозвон входов MCP — раз в 15 минут проверяет все MCP Claude Code (пользовательские, проектов, плагинов) и ловит слетевший вход раньше, чем встанет работа: одно срочное сообщение владельцу с командой входа, повтор раз в час, пока сервер мёртв; сессиям, которые с ним работают, — строка; вид показывает все серверы и когда каждый был жив", "why": "Слетевший вход MCP находит плагин, а не вставшая сессия: через 15 минут владелец знает, что слетело и как войти"}},
+  "hub": "^1.15",
+  "run": ["python3", "main.py"],
+  "web": "main.js"
+}
