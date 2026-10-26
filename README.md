@@ -1,33 +1,58 @@
 # mcp-keeper - MCP login keeper
 
-An [Agents Hub](https://github.com/flagman/agents-hub-core) plugin: every 15 minutes it calls round every MCP server of
-Claude Code - user, project and plugin servers (`plugin:<plugin>:<server>`) - and catches a lost login before a session
-gets stuck on it.
+An [Agents Hub](https://github.com/flagman/agents-hub-core) plugin: every 15 minutes it checks the OAuth logins of the MCP
+servers **the hub gives to its sessions** and says so once, before a session gets stuck on a lost login.
 
-- **One pass.** `claude mcp list` checks every server; Claude Code refreshes an expired OAuth access itself, under its
-  own lock. The plugin never refreshes or writes logins: it only reads the Claude Code credentials (the macOS keychain
-  item or `.credentials.json`). A server that answers "connected" is also asked `initialize` with its own stored access:
-  some servers let a client in without a login, and a 401/403 there means the login is gone. Servers that log in by
-  headers (`headersHelper`, `headers`) are judged by the list only.
-- **Only real losses.** Lost is an explicit refusal: "needs authentication" twice in a row, or 401/403. A timeout, no
-  network, a 5xx - "check later", nothing is said. A pass runs only after 5 minutes of a live network without sleep (a
-  one-time refresh right after a wake can be lost), and a new loss is told only if a second pass 5 minutes later sees it
-  too.
-- **To the owner.** Only a login that worked and stopped: one urgent message with every such server of the pass, the
-  most important first (one-time logins, servers a working session uses right now), each with the command to log in
-  (`hub mcp login <hub session> <server>`). Repeated hourly while the server stays lost; lifted when a check sees it
-  live. A stored login of a live server that disappeared is told as erased. "Connected" with a slow tool list (load
-  after a hub restart) is live: the login was taken.
-- **To the Hub Developer.** What blocks no work - a server never logged in, a user server with the address of a
-  plugin's server (Claude Code loads the user one, and the plugin's login is never refreshed) - one line a day to the
-  hub's developer session, not to the owner.
-- **To sessions.** Sessions that work with a lost server right now get one line: do not loop on its tools; the hub
-  reconnects it after the login.
-- **A trail.** When a one-time login (its refresh token works only once) is lost, the processes of Claude Code and of the
-  server at that moment are kept in the plugin state (`<hub state>/mcp-keeper/state.json`, `traces`), long tokens in
-  command lines masked - to find out later who spent it.
-- **View.** "MCP logins": every server, its state and when it was last live (`status.json` next to the plugin,
-  rewritten every pass). The plugin channel gets one line when the picture changes: live, lost, later.
+## What it watches (and what it does not)
+
+- **Only what sessions get.** The servers of the hub catalog (`hub.json` `mcp.<name>.server`) and the MCP servers of
+  plugins (`plugin:<plugin>:<server>`) that live sessions carry. Hub sessions run with `--strict-mcp-config`: they never
+  read `~/.claude.json`, so the MCP of a plain Claude Code outside the hub is not checked.
+- **Remote servers only.** A server that runs as a program (stdio) is never started. `claude mcp list` is never run
+  (it starts every stdio server). A server with `headers`/`headersHelper` logs in by itself and is skipped.
+- **No second watchdog.** The core's MCP watch already tells sessions about "needs a login" and reconnects them. The
+  plugin adds what it does not do: a stored login that a server now rejects, an erased record, a token that cannot be
+  refreshed - and tells the owner once.
+
+## One pass
+
+1. The stored access token (Claude Code credentials: the macOS keychain item or `.credentials.json`, read only, never
+   written) goes in an `initialize` request to the server's own address. 401/403 - the login is rejected.
+2. The access has expired and a refresh token exists: Claude Code refreshes it itself, under its own lock. The plugin asks
+   `claude mcp get <server>` - this one server, at most once an hour while the stored login does not change, never for
+   a one-time login (`one_time`, default `canva`: a run killed in the middle of the exchange loses it). If you prefer
+   that the plugin never runs `claude`, set `ask_claude` to `false`: such a server is "later".
+3. `claude mcp get` runs with a time limit (90 s). When it runs over, the whole process tree is killed (the process
+   group on macOS/Linux, `taskkill /T` on Windows) - no orphans, no hung `claude`.
+
+Lost is only an explicit refusal (401/403, "needs authentication" twice, an erased record, an expired token without a
+refresh token). A timeout, no network, a 5xx - "check later", nothing is said. A pass runs only after 5 minutes of a live
+network without sleep, and a new loss is told only if a second pass 5 minutes later sees it too.
+
+## Alarms
+
+- **One alarm per server per day**, kept on disk (`<hub state>/mcp-keeper/state.json`, so a restart does not repeat
+  it). A server stays "open" until a pass sees it live; it is told again only after it was seen live and lost again,
+  and never within a day of its last alarm.
+- **A cap for the whole plugin**: at most `max_alarms` (default 6) messages a day; the rest wait for room and go in one
+  message.
+- One urgent message per pass lists the newly lost servers, the most important first (one-time logins, servers a working
+  session uses right now), each with `hub mcp login <hub session> <server>`. Lifted when a check sees the server live.
+- Sessions that work with a lost server right now get one line (once per loss): do not loop on its tools.
+- A server never logged in is never an alarm.
+
+## Duplicates (off by default)
+
+A user server in `~/.claude.json` with the address of a plugin's server hides the plugin's one from Claude Code
+(the login under `plugin:...` is never refreshed). It touches only Claude Code outside the hub, so it is **off by
+default**; `check_duplicates: true` sends one line a day to the hub's developer session.
+
+## What is stored
+
+Server names, states and times - nothing else. No command lines, arguments, headers, addresses or query strings: the
+`claude mcp get` output is parsed in memory and dropped; the trail kept when a one-time login is lost holds only
+`{pid, started, kind}` of the processes of that moment. Files written by older versions (the raw `claude mcp list`
+output, command lines, free-form status rows) are removed or rewritten at start.
 
 ## Settings
 
@@ -37,15 +62,20 @@ gets stuck on it.
 |---|---|---|
 | `every_minutes` | 15 | minutes between passes |
 | `ignore` | `[]` | server names not to check (`hub.json` `mcp_auth_ignore` counts too) |
-| `one_time` | `["canva"]` | servers whose refresh token works once |
+| `one_time` | `["canva"]` | servers whose refresh token works once: `claude` is never run for them |
 | `warn_days` | 3 | a login without a refresh token - warn this many days before it expires |
+| `max_alarms` | 6 | messages to the owner a day, the whole plugin |
+| `ask_claude` | `true` | `false` - never run `claude mcp get`, an expired access is "later" |
+| `check_duplicates` | `false` | one line a day about a user server that hides a plugin's one |
 | `quiet_until` | - | epoch or `YYYY-MM-DDTHH:MM` (hub timezone): no alarms until then |
+
+The view "MCP logins" shows every server, its state and when it was last live (`status.json` next to the plugin).
 
 Run one pass by hand: `PYTHONPATH=<hub code> python3 main.py --once`.
 
 Tests: `PYTHONPATH=<hub code> python3 -m unittest discover -s tests` - no real `claude`, network or keychain.
 
-Иконка — [3D Fluency](https://icons8.com/icons/3d-fluency) от Icons8.
+Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 
 ## License
 

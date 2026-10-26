@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""mcp-keeper — the process of the plugin: calls round every MCP server of Claude Code and catches a lost login
-before work stops on it.
+"""mcp-keeper — the process of the plugin: watches the OAuth logins of the MCP servers the hub gives to its sessions
+and says so before work stops on a lost one.
 
-Every `every_minutes` (15) one pass:
-  1. `claude mcp list` — Claude Code checks every server (user, project, plugin:<plugin>:<server>) and refreshes an
-     expired OAuth access under its own lock. Run detached and never killed: a one-time refresh token cut off in the
-     middle of an exchange loses the login. A previous run still alive - this pass goes without it.
-  2. "needs authentication" - checked again in RECHECK seconds (a single answer like that happens).
-  3. A server that answers "connected" may let a client in without any login (some do): its own OAuth access from the
-     Claude Code credentials (read only, never written) goes in an `initialize` request; 401/403 - the login is
-     rejected. Servers that log in by headers (headersHelper / headers) are judged by the list only.
-Lost is only an explicit refusal (needs authentication twice, 401/403 on initialize). A timeout, no network, 5xx -
-"later", nothing to the owner. A pass runs only after COOLDOWN seconds of a live network without sleep (the wall clock
-jumping away from the monotonic one); a new loss is told only if a second pass CONFIRM_AFTER seconds later sees it too.
-A lost login is told again hourly while it stays lost; everything found in one pass goes in one message, the most
-important first (one-time logins, servers a working session uses). It is lifted only by a live check. A stored login
-of a live server that disappeared is told as erased; for a one-time login (its refresh token works once) the processes
-of Claude Code and of the server at that moment are kept in the plugin state, to find who spent it. A user server with
-the address of a plugin server hides the plugin's login - told in the same message.
+What it watches: the servers of hub.json `mcp.<name>.server` plus the MCP servers (also plugins') that live hub sessions
+carry now (session info) - not ~/.claude.json of a plain Claude Code. Of them only the remote ones that have a stored
+OAuth login; a stdio server is never started, and `claude mcp list` is never run.
+
+Every `every_minutes` (15) one pass, per server:
+  1. the stored access (Claude Code credentials, read only, never written) goes in an `initialize` request to the
+     server's own address: 401/403 - the login is rejected.
+  2. the access has expired and there is a refresh token: Claude Code refreshes it itself, under its own lock - the
+     plugin asks `claude mcp get <server>` (this server only, at most once an hour, never for a one-time login) with a
+     time limit, the whole process tree is killed when it runs over, and the output is parsed in memory, never stored.
+Lost is only an explicit refusal (401/403, "needs authentication", an erased record, a token that cannot be refreshed).
+A timeout, no network, 5xx - "later", nothing is said. A pass runs only after COOLDOWN seconds of a live network
+without sleep (the wall clock jumping away from the monotonic one); a new loss is told only if a second pass
+CONFIRM_AFTER seconds later sees it too.
+
+To the owner: one urgent message per pass with the servers that are newly lost. One alarm per server per day, kept on
+disk: it is repeated only after the server was seen live and was lost again, and never within a day of the last one; the
+whole plugin says at most `max_alarms` a day. Sessions that work with a lost server get one line.
+Never a server never logged in (the core's MCP watch tells sessions about it) and never a duplicate unless
+`check_duplicates` is on.
 
 Out: the fact ext.<name>.checked, owner.notify (urgent - a quiet Telegram summary would swallow it), a short message
 to the sessions that are working with this server right now, and the status in the plugin's channel (for its view).
-Secrets are never printed or written: only server names and states.
+The state files hold server names, states and times only - no command lines, arguments, headers or addresses.
 
-Settings - hub.json extensions[<plugin>]: every_minutes (15), warn_days (3), ignore ([names]), quiet_until (epoch or
-"YYYY-MM-DDTHH:MM" in the hub timezone); hub.json mcp_auth_ignore is honoured too.
+Settings - hub.json extensions[<plugin>]: every_minutes (15), warn_days (3), ignore ([names]), one_time ([names]),
+max_alarms (6 a day), ask_claude (true), check_duplicates (false), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
+timezone); hub.json mcp_auth_ignore is honoured too.
 """
-import datetime, hashlib, json, os, re, shutil, socket, subprocess, sys, time, urllib.error, urllib.request
+import datetime, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.request
 
 KEY = os.environ.get("HUB_EXTENSION") or "mcp-keeper"   # hub.json extensions key: <account>:mcp-keeper from the market
 NAME = KEY.split(":")[-1]                                # channel and fact name
@@ -34,36 +39,36 @@ STATE = os.environ.get("HUB_STATE_DIR") or os.path.expanduser("~/.hub-core")
 HOME = os.path.join(STATE, "mcp-keeper")
 NOTE_ID = "mcp"
 DAY = 24 * 3600
-REPEAT = 3600             # a lost login is told again hourly while it stays lost
 ONE_TIME = ("canva",)     # servers whose refresh token works once: a lost exchange loses the login
 EVERY = 15                # minutes between passes
+MAX_ALARMS = 6            # messages to the owner a day, the whole plugin
 START_DELAY = 60          # first pass after a start: the hub restarts in batches
 AGAIN_AFTER = 600         # the process was restarted - a pass not more often than this
 CONFIRM_AFTER = 300       # a new loss - checked again after this many seconds
 RECHECK = 30              # "needs authentication" - asked again after this many seconds
+ASK_EVERY = 3600          # `claude mcp get` about one server - not more often than this
+GET_TIMEOUT = 90          # a `claude mcp get` run over this is killed, with everything it started
+KILL_GRACE = 3            # seconds between SIGTERM and SIGKILL of that tree
 COOLDOWN = 300            # a pass only after this many seconds of live network without sleep
 WAKE_JUMP = 60            # wall clock ran away from the monotonic one by more - the machine slept
 NET_STEP = 30
 MAX_WAIT = 1800
 TRIES = 3
-LIST_TIMEOUT = 300
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
 UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" to Python-urllib
+STATES = ("ok", "lost", "later")
 
 STR = {
     "en": {
         "title": "MCP logins",
         "lost_topic": "MCP login lost",
         "lost": "MCP login lost: {names} - log in:",
-        "lost_line": "• {name} - {why}: {fix}",
-        "note_topic": "MCP logins",
+        "lost_line": "\u2022 {name} - {why}: {fix}",
         "why_wiped": "the stored login was erased (the server was live with it)",
-        "first": "MCP was never logged in: {names} - log in once, after that Claude Code refreshes it itself:",
-        "first_line": "• {name}: {fix}",
         "dup": "MCP duplicate: {names} - the same server as a plugin's; Claude Code loads the user one and the plugin's "
                "login is never refreshed:",
-        "dup_line": "• {name} hides {plugin}: claude mcp remove {name} -s user",
+        "dup_line": "\u2022 {name} hides {plugin}: claude mcp remove {name} -s user",
         "why_auth": "needs authentication",
         "why_rejected": "the server rejects the access (HTTP {code})",
         "why_expires": "the token without refresh expires {day}",
@@ -71,26 +76,16 @@ STR = {
         "to_session": "MCP {server}: the login is lost, the owner is told. Its tools fail until then - do not repeat "
                       "the calls in a loop; work without it or wait, the hub reconnects it after the login.",
         "status": "MCP: {ok} live, {bad} lost, {later} later",
-        "view_title": "MCP logins",
-        "view_sub": "every MCP server of Claude Code, called round every {n} min",
-        "col_server": "Server", "col_state": "State", "col_ok": "Last live",
-        "st_ok": "live", "st_lost": "login lost", "st_first": "never logged in", "st_later": "check later",
-        "st_failed": "does not connect", "st_idle": "plugin, not logged in",
-        "none": "No pass yet: the first one goes a minute after the start, after a calm network.",
-        "checked": "Checked {when}",
     },
     "ru": {
         "title": "Входы MCP",
         "lost_topic": "Слетел вход MCP",
         "lost": "Слетел вход MCP: {names} — войди:",
-        "lost_line": "• {name} — {why}: {fix}",
-        "note_topic": "Входы MCP",
+        "lost_line": "\u2022 {name} — {why}: {fix}",
         "why_wiped": "запись входа стёрта (до этого сервер с ней работал)",
-        "first": "В MCP ни разу не входили: {names} — войди один раз, дальше Claude Code освежает вход сам:",
-        "first_line": "• {name}: {fix}",
         "dup": "Дубль MCP: {names} — тот же сервер, что у плагина; Claude Code берёт пользовательский, вход плагина "
                "не освежается:",
-        "dup_line": "• {name} скрывает {plugin}: claude mcp remove {name} -s user",
+        "dup_line": "\u2022 {name} скрывает {plugin}: claude mcp remove {name} -s user",
         "why_auth": "ждёт входа",
         "why_rejected": "сервер отвергает доступ (HTTP {code})",
         "why_expires": "токен без refresh истекает {day}",
@@ -98,19 +93,11 @@ STR = {
         "to_session": "MCP {server}: слетел вход, владелец знает. До входа его инструменты не работают — не повторяй "
                       "вызовы по кругу; работай без него или подожди, после входа хаб переподключит сервер.",
         "status": "MCP: живы {ok}, слетели {bad}, позже {later}",
-        "view_title": "Входы MCP",
-        "view_sub": "все MCP Claude Code, прозвон раз в {n} мин",
-        "col_server": "Сервер", "col_state": "Состояние", "col_ok": "Последний раз жив",
-        "st_ok": "жив", "st_lost": "слетел вход", "st_first": "ни разу не входили", "st_later": "проверить позже",
-        "st_failed": "не подключается", "st_idle": "плагин, вход не нужен был",
-        "none": "Прохода ещё не было: первый — через минуту после старта, при спокойной сети.",
-        "checked": "Проверено {when}",
     },
 }
 
 
 # ───── language, settings, state ─────
-
 def lang():
     """Hub language at the moment of use (it may change while the process lives)."""
     try:
@@ -171,6 +158,9 @@ def settings():
             "warn_days": float(own.get("warn_days", 3)),
             "one_time": {short(x) for x in own.get("one_time", ONE_TIME)},
             "quiet_until": parse_quiet(own.get("quiet_until"), cfg.get("timezone")),
+            "max_alarms": max(1, int(own.get("max_alarms") or MAX_ALARMS)),
+            "ask_claude": own.get("ask_claude", True) is not False,
+            "check_duplicates": own.get("check_duplicates", False) is True,
             "ignore": {str(x).lower() for x in list(own.get("ignore") or []) + list(skip if isinstance(skip, list) else [])}}
 
 
@@ -241,75 +231,78 @@ def claude_cmd():
     return [found] if found else None
 
 
-def alive(pid):
+def kill_tree(proc):
+    """The process and everything it started: its process group on POSIX (it was started as a leader), taskkill /T on
+    Windows. SIGTERM, a short grace, then SIGKILL for the stragglers."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
     try:
-        from platforms import current
-        return current.alive(pid)
-    except Exception:   # noqa: BLE001
-        return False
-
-
-def detached(cmd, out):
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
     try:
-        from platforms import current
-        return current.popen_detached(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                      cwd=os.path.expanduser("~"))
-    except ImportError:
-        return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                cwd=os.path.expanduser("~"), start_new_session=True)
-
-
-def mcp_list():
-    """(code, text) of `claude mcp list`; "busy" - the previous run is still alive; None - could not start.
-
-    Detached, under a lock {pid, at}, never killed: Claude Code may be in the middle of a one-time refresh exchange,
-    and a process killed after the server issued a new pair but before it was written loses the login."""
-    cmd = claude_cmd()
-    if not cmd:
-        return None
-    lock = os.path.join(HOME, "list.lock.json")
-    held = read_json(lock) or {}
-    if held.get("pid") and alive(held["pid"]) and time.time() - float(held.get("at") or 0) < 2 * LIST_TIMEOUT:
-        return "busy"
-    os.makedirs(HOME, exist_ok=True)
-    path = os.path.join(HOME, "list.out")
+        proc.wait(KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
     try:
-        with open(path, "wb") as f:
-            proc = detached(cmd + ["mcp", "list"], f)
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_limited(cmd, timeout):
+    """(code, text) of a command run with a time limit; the output stays in memory. Over the limit - (124, "") and the
+    whole process tree killed, no orphans. None - could not start."""
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL,
+          "cwd": os.path.expanduser("~")}
+    if os.name != "nt":
+        kw["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(cmd, **kw)
     except OSError:
         return None
-    write_json(lock, {"pid": proc.pid, "at": time.time()})
     try:
-        code = proc.wait(LIST_TIMEOUT)
+        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return 124, ""   # not killed: the lock holds the next pass off
-    if (read_json(lock) or {}).get("pid") == proc.pid:
+        kill_tree(proc)
         try:
-            os.unlink(lock)
-        except OSError:
+            proc.communicate(timeout=5)
+        except Exception:   # noqa: BLE001 - the tree is dead; whatever is left in the pipe is not needed
             pass
-    with open(path, "rb") as f:
-        return code, text_of(f.read())
+        return 124, ""
+    return proc.returncode, text_of(out)
 
 
-LINE = re.compile(r"^(\S+?): .* - (.+)$")   # names have no spaces but may have colons: plugin:slack:slack
+def mcp_get(name):
+    """(code, text) of `claude mcp get <name>` - one server, never the whole list (that starts every stdio server);
+    None - no claude. Claude Code refreshes an expired OAuth access of this server itself, under its own lock."""
+    cmd = claude_cmd()
+    if not cmd or str(name).startswith("-"):
+        return None
+    return run_limited(cmd + ["mcp", "get", str(name)], GET_TIMEOUT)
 
 
-def parse_list(text):
-    """`claude mcp list` -> {server: connected | auth | failed}; disabled ones are skipped."""
-    out = {}
-    for line in text.splitlines():
-        m = LINE.match(line.strip())
-        if not m:
-            continue
-        name, status = m.group(1), m.group(2).lower()
-        if "disabled" in status:
-            continue
-        # "! Connected · tools fetch failed - Request timed out": the login was taken, only the tool list was slow
-        # (load right after a hub restart) - live; "✘ Failed to connect" - does not connect at all
-        out[name] = ("failed" if "failed to connect" in status else "connected" if "connected" in status
-                     else "auth" if "auth" in status else "failed")
-    return out
+def parse_get(text):
+    """`claude mcp get` -> connected | auth | failed | None (no such server, no answer)."""
+    low = (text or "").lower()
+    if not low.strip() or "no mcp server" in low:
+        return None
+    m = re.search(r"status:\s*(.+)", low)
+    status = m.group(1) if m else low
+    # "! Connected - tools fetch failed - Request timed out": the login was taken, only the tool list was slow (load
+    # right after a hub restart) - live; "failed to connect" - does not connect at all
+    if "failed to connect" in status:
+        return "failed"
+    if "connected" in status:
+        return "connected"
+    if "auth" in status:
+        return "auth"
+    return None
 
 
 # ───── Claude Code files: read only ─────
@@ -354,22 +347,6 @@ def oauth_entries(blob):
         if isinstance(v, dict):
             out.setdefault(str(v.get("serverName") or str(k).split("|")[0]), v)
     return out
-
-
-def user_servers():
-    """{name: config} of ~/.claude.json: user scope and every project."""
-    cj = read_json(claude_json()) or {}
-    out = dict(cj.get("mcpServers") or {}) if isinstance(cj.get("mcpServers"), dict) else {}
-    for proj in (cj.get("projects") or {}).values():
-        for n, c in (((proj or {}).get("mcpServers") or {}) if isinstance(proj, dict) else {}).items():
-            out.setdefault(n, c)
-    return out
-
-
-def header_servers():
-    """Servers that log in by headers, not OAuth: a credentials entry of theirs is a leftover; the list judges them."""
-    return {str(n).lower() for n, c in user_servers().items()
-            if isinstance(c, dict) and (c.get("headersHelper") or c.get("headers"))}
 
 
 def plugin_servers():
@@ -513,6 +490,36 @@ class Calm:
 CALM = Calm()
 
 
+# ───── what the hub gives to sessions ─────
+
+def remote(server):
+    """A server that logs in by OAuth over the network: an address, no program, no headers (those log in by themselves)."""
+    return (isinstance(server, dict) and isinstance(server.get("url"), str) and bool(server["url"].strip())
+            and not server.get("command") and not (server.get("headers") or server.get("headersHelper")))
+
+
+def served(hub_st):
+    """{name: url or None} - remote servers the hub gives to its sessions: the hub catalog (hub.json mcp.<name>.server) and
+    MCP servers of plugins (plugin:<plugin>:<server>). The MCP of Claude Code outside the hub (~/.claude.json) is not
+    here, and a server that runs as a program (stdio) is never here: nothing is started to look at it."""
+    catalog = (config() or {}).get("mcp")
+    out, prints = {}, set()
+    for n, v in sorted((catalog if isinstance(catalog, dict) else {}).items()):
+        srv = v.get("server") if isinstance(v, dict) else None
+        if remote(srv):
+            out[str(n)] = srv["url"]
+        if isinstance(srv, dict) and fingerprint(srv):
+            prints.add(fingerprint(srv))
+    for n, v in sorted(plugin_servers().items()):
+        if remote(v) and fingerprint(v) not in prints:   # the core drops the plugin's twin of a catalog server
+            out.setdefault(n, v["url"])
+    for s in (hub_st.get("sessions") or {}).values():
+        for n in (s.get("info") or {}).get("mcp") or []:
+            if isinstance(n, str) and n.startswith("plugin:"):
+                out.setdefault(n, None)
+    return out
+
+
 # ───── one pass ─────
 
 def login_fix(server, hub):
@@ -543,89 +550,84 @@ def in_use(st):
     return out
 
 
-def listed():
-    """`claude mcp list` parsed, or a reason why not: a run only on a settled machine - the list refreshes expired
-    logins, and a one-time refresh right after a wake or on a shaky network may be lost."""
-    if not CALM.settled():
-        return "unsettled"
-    r = mcp_list()
-    if not isinstance(r, tuple):
-        return r or "no claude"
-    if r[0] == 124:
-        return "timeout"
-    return parse_list(r[1]) or f"no list (code {r[0]})"
+def verdict_of(name):
+    """connected | auth | later from one `claude mcp get <name>`."""
+    r = mcp_get(name)
+    if not isinstance(r, tuple) or r[0] == 124:
+        return "later"
+    return {"connected": "connected", "auth": "auth"}.get(parse_get(r[1]), "later")
 
 
-def checkup(conf, now, seen, had, hub="hub"):
-    """{servers: {name: {state, why, fix}}, later_all}; states: ok | lost | first | idle | failed | later.
-    seen - names once live, had - names that once had a stored login (both from the plugin state)."""
-    ignore = conf["ignore"]
-    got = listed()
-    if not isinstance(got, dict):
-        return {"servers": {}, "later_all": True, "why": got}
-    if "auth" in got.values():
+def ask(name, ent, now, st, conf):
+    """What Claude Code says about this one server (it refreshes an expired OAuth access itself, under its own lock).
+    Not for a one-time login (a run killed in the middle of the exchange loses it), not when switched off. One run
+    asks again a minute later if it says "needs authentication"; the answer is kept for an hour while the stored login
+    does not change, so a confirming pass runs nothing. Nothing of the output is kept but the verdict."""
+    if not conf["ask_claude"] or short(name) in conf["one_time"]:
+        return "later"
+    rec = (st.setdefault("asked", {})).get(name)
+    exp = ent.get("expiresAt") or 0
+    if isinstance(rec, dict) and now - rec.get("at", 0) < ASK_EVERY and rec.get("exp") == exp:
+        return rec.get("verdict") or "later"
+    verdict = verdict_of(name)
+    if verdict == "auth":
         time.sleep(RECHECK)
-        again = listed()
-        got = {n: ((again.get(n, s) if isinstance(again, dict) else "later") if s == "auth" else s)
-               for n, s in got.items()}
+        verdict = verdict_of(name)
+    st["asked"][name] = {"at": now, "exp": exp, "verdict": verdict}
+    return verdict
+
+
+def checkup(conf, now, st, hub, hub_st):
+    """{servers: {name: {state, why, fix}}, logged} for what the hub gives to sessions; states: ok | lost | later.
+    A live access is asked of the server itself (initialize); an expired one - of Claude Code, about this server only."""
+    ignore, had = conf["ignore"], set(st.get("had") or [])
     entries = oauth_entries(credentials())
-    headers = header_servers()
-    out = {}
-    for name, state in sorted(got.items()):
+    out, logged = {}, []
+    for name, url in sorted(served(hub_st).items()):
         if ignored(name, ignore):
             continue
         ent = entries.get(name) or {}
-        logged = bool(ent.get("accessToken") or ent.get("refreshToken"))
-        oauth = name.lower() not in headers
-        if state == "later":
-            out[name] = {"state": "later"}
-            continue
-        if oauth and name in had and not logged and state != "failed":
-            # it was live with a stored login and the record is gone: something erased it
-            out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": login_fix(name, hub), "wiped": True}
-            continue
-        if state == "failed":
-            out[name] = {"state": "failed"}   # the core reconnects failed servers in sessions itself
-            continue
-        if state == "auth":
-            if name in seen or (logged and oauth):
-                out[name] = {"state": "lost", "why": tr("why_auth"), "fix": login_fix(name, hub)}
-            elif name.startswith("plugin:"):
-                out[name] = {"state": "idle"}   # a plugin's server nobody ever needed: not an alarm
-            else:
-                out[name] = {"state": "first", "fix": login_fix(name, hub)}
-            continue
-        row = {"state": "ok"}
-        if oauth and ent:
-            expires = (ent.get("expiresAt") or 0) / 1000
-            if ent.get("accessToken") and (not expires or expires > now + 60):
-                ok, code = probe(ent)
-                if ok is False:
-                    row = {"state": "lost", "why": tr("why_rejected", code=code), "fix": login_fix(name, hub)}
-            if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
-                why = (tr("why_expired") if expires <= now
-                       else tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
-                row = {"state": "lost", "why": why, "fix": login_fix(name, hub)}
+        has = bool(ent.get("accessToken") or ent.get("refreshToken"))
+        if not has:
+            if name in had:   # it was live with a stored login and the record is gone: something erased it
+                out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": login_fix(name, hub)}
+            continue   # never logged in: a login nobody made is no loss
+        logged.append(name)
+        lose = lambda why: {"state": "lost", "why": why, "fix": login_fix(name, hub)}
+        expires = (ent.get("expiresAt") or 0) / 1000
+        row = {"state": "later"}
+        if ent.get("accessToken") and (not expires or expires > now + 60):
+            ok, code = probe({**ent, "serverUrl": ent.get("serverUrl") or url})
+            if ok is False:
+                row = lose(tr("why_rejected", code=code))
+            elif ok:
+                row = {"state": "ok"}
+        elif ent.get("refreshToken"):
+            said = ask(name, ent, now, st, conf)
+            row = lose(tr("why_auth")) if said == "auth" else {"state": "ok"} if said == "connected" else row
+        else:
+            row = lose(tr("why_expired"))
+        if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
+            row = lose(tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
         out[name] = row
-    return {"servers": out, "later_all": False,
-            "logged": sorted(n for n, e in entries.items() if e.get("accessToken") or e.get("refreshToken"))}
+    return {"servers": out, "logged": logged, "later_all": False}
 
 
 def lost(res):
     return {n: s for n, s in res["servers"].items() if s["state"] == "lost"}
 
 
-def confirmed(first, st, conf, seen, had, hub):
+def confirmed(first, now, conf, st, hub, hub_st):
     """A new loss - a second pass CONFIRM_AFTER later, on a calm network: only what is lost both times. None - it shook
     in between: the pass does not count."""
-    fresh = set(lost(first)) - set(st.get("told") or [])
+    fresh = {n for n in lost(first) if not (st.get("alarms") or {}).get(n, {}).get("open")}
     if not fresh:
         return first
     if not CALM.wait(CONFIRM_AFTER):
         return None
     since = CALM.shaken
-    again = checkup(conf, time.time(), seen, had, hub)
-    if not CALM.steady(since) or again["later_all"]:
+    again = checkup(conf, now + CONFIRM_AFTER, st, hub, hub_st)
+    if not CALM.steady(since):
         return None
     for n, s in again["servers"].items():
         if s["state"] == "lost" and n not in lost(first):
@@ -633,17 +635,15 @@ def confirmed(first, st, conf, seen, had, hub):
     return again
 
 
-def calm_pass(conf, st, seen, had, hub):
+def calm_pass(conf, now, st, hub, hub_st):
     res = None
     for _ in range(TRIES):
         if not CALM.wait():
             return {"servers": {}, "later_all": True, "why": "unsettled"}
         since = CALM.shaken
-        res = checkup(conf, time.time(), seen, had, hub)
-        if res["later_all"]:
-            return res
+        res = checkup(conf, now, st, hub, hub_st)
         if CALM.steady(since):
-            done = confirmed(res, st, conf, seen, had, hub)
+            done = confirmed(res, now, conf, st, hub, hub_st)
             if done is not None:
                 return done
     for n, s in res["servers"].items():   # it kept shaking: no verdict this time
@@ -668,12 +668,44 @@ def remember(st, key, names, now, doubt, every=DAY):
     return "resolve" if told and not st[key] else None
 
 
-MASK = re.compile(r"[A-Za-z0-9_\-.~+/=]{24,}")   # tokens and keys in command lines
+def alarms_step(st, servers, bad, conf, now, hold):
+    """One alarm per server a day, kept in the state file: a server lost stays "open" until a pass sees it live; a loss
+    again within a day of its last alarm is not told; the plugin as a whole says at most `max_alarms` messages a day,
+    the rest waits for room. Returns (servers to tell in this message, the card is to be lifted)."""
+    al = st.setdefault("alarms", {})
+    st["sent"] = sent = [t for t in st.get("sent") or [] if now - t < DAY]
+    hanging = lambda: any(a.get("open") and a.get("told") for a in al.values())
+    before = hanging()
+    for n, a in al.items():
+        if a.get("open") and n not in bad and (n not in servers or servers[n]["state"] == "ok"):
+            a["open"] = False   # proven live (a server in doubt keeps its alarm)
+    for n in [n for n, a in al.items() if not a.get("open") and now - a.get("at", 0) >= DAY]:
+        del al[n]
+    fresh = []
+    for n in sorted(bad):
+        a = al.get(n) or {}
+        if a.get("open"):
+            continue
+        if "at" in a and now - a["at"] < DAY:
+            al[n] = {"open": True, "told": False, "at": a["at"]}   # lost again within a day: quiet
+        else:
+            fresh.append(n)
+    told = []
+    if fresh and not hold and len(sent) < conf["max_alarms"]:
+        sent.append(now)
+        told = fresh
+        for n in told:
+            al[n] = {"open": True, "told": True, "at": now}
+    return told, before and not hanging()
+
+
+MAX_TRACES = 20
+KINDS = ("claude", "server")
 
 
 def processes(server):
-    """[{pid, started, cmd}] - processes of Claude Code and of this MCP server now: kept in the plugin state when a
-    one-time login is lost, to find later who refreshed it. Long tokens in command lines are masked."""
+    """[{pid, started, kind}] - processes of Claude Code and of this MCP server now: kept in the plugin state when a
+    one-time login is lost, to find later who refreshed it. Never the command line: only who, since when, what kind."""
     word = short(server)
     rows = []
     try:
@@ -696,9 +728,10 @@ def processes(server):
     out = []
     for pid, started, cmd in rows:
         low = cmd.lower()
-        if word in low or re.search(r"(^|[\\/ ])claude(\.exe|\.cmd)?( |$)", low) or "mcp-remote" in low:
-            if pid != os.getpid():
-                out.append({"pid": pid, "started": started, "cmd": MASK.sub("…", cmd)[:300]})
+        kind = ("claude" if re.search(r"(^|[\\/ ])claude(\.exe|\.cmd)?( |$)", low)
+                else "server" if word in low or "mcp-remote" in low else None)
+        if kind and pid != os.getpid():
+            out.append({"pid": pid, "started": started, "kind": kind})
     return out[:40]
 
 
@@ -708,7 +741,7 @@ def order(bad, conf, use, ok_at):
     return sorted(bad, key=lambda n: (short(n) not in conf["one_time"], n not in use, -float(ok_at.get(n) or 0), n))
 
 
-def message(bad, first, dups, conf, use, ok_at):
+def message(bad, dups, conf, use, ok_at):
     lines = []
     if bad:
         names = order(bad, conf, use, ok_at)
@@ -716,21 +749,64 @@ def message(bad, first, dups, conf, use, ok_at):
         lines += [tr("lost_line", name=n, why=bad[n]["why"], fix=bad[n]["fix"]) for n in names]
     if dups:
         lines += [tr("dup", names=", ".join(d["name"] for d in dups))] + [tr("dup_line", **d) for d in dups]
-    if first:
-        lines += [tr("first", names=", ".join(sorted(first)))]
-        lines += [tr("first_line", name=n, fix=first[n]["fix"]) for n in sorted(first)]
     return "\n".join(lines)
 
+
+# ───── status and cleaning ─────
 
 def status_path():
     """status.json next to the plugin: the page reads it from /ext/<plugin>/status.json (no-cache)."""
     return os.environ.get("MCP_KEEPER_STATUS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "status.json")
 
 
+def clean_status(data):
+    """The view's data as a whitelist: per server a state and the time it was last live - nothing else, whatever an
+    older version wrote there."""
+    if not isinstance(data, dict):
+        return None
+    num = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    rows = {}
+    for n, r in (data.get("servers") if isinstance(data.get("servers"), dict) else {}).items():
+        if isinstance(r, dict) and r.get("state") in STATES:
+            why = r.get("why") if isinstance(r.get("why"), str) and len(r["why"]) <= 160 and "://" not in r["why"] else None
+            rows[str(n)] = {"state": r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
+                            **({"why": why} if why else {})}
+    return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY, "servers": rows}
+
+
 def write_status(st):
     """The view's data - from the plugin state (a market update replaces the folder: rewritten at start too)."""
     if st.get("status"):
         write_json(status_path(), st["status"])
+
+
+def start_clean():
+    """At start: what 0.1.x kept goes away - the raw `claude mcp list` output and its lock, command lines of processes,
+    free-form rows of the status; the old "told" lists become alarms (one hanging at the owner stays hanging)."""
+    for name in ("list.out", "list.lock.json"):
+        try:
+            os.unlink(os.path.join(HOME, name))
+        except OSError:
+            pass
+    st = load_state()
+    for t in (st.get("traces") or {}).values():
+        if isinstance(t, dict):
+            t["processes"] = [{k: p[k] for k in ("pid", "started", "kind") if k in p}
+                              for p in t.get("processes") or [] if isinstance(p, dict)]
+    al = st.setdefault("alarms", {})
+    old_at = st.get("told_at") if isinstance(st.get("told_at"), dict) else {}
+    for n in st.pop("told", None) or []:
+        al.setdefault(n, {"open": True, "told": True, "at": old_at.get(n) or 0})
+    for k in ("told_at", "told_first", "told_first_at", "split"):
+        st.pop(k, None)
+    clean = clean_status(st.get("status"))
+    st.pop("status", None)
+    if clean:
+        st["status"] = clean
+    save_state(st)
+    old = clean_status(read_json(status_path()))
+    if old:
+        write_json(status_path(), old)
 
 
 def post_status(st, res, conf, now):
@@ -754,10 +830,9 @@ def once(now=None):
     st = load_state()
     hub_st = hub_state()
     hub = hub_session(hub_st)
-    seen, had = set(st.get("seen_ok") or []), set(st.get("had") or [])
-    res = calm_pass(conf, st, seen, had, hub)
     now = now or time.time()
     st["at"] = now
+    res = calm_pass(conf, now, st, hub, hub_st)
     if res["later_all"]:
         save_state(st)
         put(f"ext.{NAME}.checked", {"later": True, "why": res.get("why")})
@@ -767,53 +842,43 @@ def once(now=None):
     for n, s in servers.items():
         if s["state"] == "ok":
             ok_at[n] = now
-    seen |= {n for n, s in servers.items() if s["state"] == "ok"}
-    st["seen_ok"] = sorted(seen)
     # a login counts as "had" only on a live server: a record erased later is then told as erased
-    st["had"] = sorted(had | {n for n in res.get("logged") or [] if servers.get(n, {}).get("state") == "ok"})
-    res["dups"] = duplicates()
+    st["had"] = sorted(set(st.get("had") or []) | {n for n in res["logged"] if servers.get(n, {}).get("state") == "ok"})
+    res["dups"] = duplicates() if conf["check_duplicates"] else []
     bad = lost(res)
     put(f"ext.{NAME}.checked", {"ok": sorted(n for n, s in servers.items() if s["state"] == "ok"),
                                 "lost": [{"name": n, "why": s.get("why")} for n, s in sorted(bad.items())],
-                                "first": sorted(n for n, s in servers.items() if s["state"] == "first"),
-                                "failed": sorted(n for n, s in servers.items() if s["state"] == "failed"),
-                                "later": sorted(n for n, s in servers.items() if s["state"] == "later"),
+                                "later": sorted(n for n, s in servers.items() if s["state"] in ("later", "failed")),
                                 "dups": res["dups"]})
     post_status(st, res, conf, now)
+    al = st.setdefault("alarms", {})
     for n in bad:   # a one-time login lost: who was running then - for finding the cause later
-        if short(n) in conf["one_time"] and n not in (st.get("told") or []):
-            st.setdefault("traces", {})[n] = {"at": now, "why": bad[n].get("why"), "processes": processes(n)}
-    if conf["quiet_until"] and now < conf["quiet_until"]:
-        if st.get("hushed") != conf["quiet_until"]:
+        if short(n) in conf["one_time"] and not al.get(n, {}).get("open"):
+            traces = st.setdefault("traces", {})
+            traces[n] = {"at": now, "why": bad[n].get("why"), "processes": processes(n)}
+            for old in sorted(traces, key=lambda k: traces[k].get("at") or 0)[:-MAX_TRACES]:
+                del traces[old]
+    hold = bool(conf["quiet_until"] and now < conf["quiet_until"])
+    if hold and st.get("hushed") != conf["quiet_until"]:   # quiet: the card goes, what is still lost is told after it
+        if any(a.get("open") and a.get("told") for a in al.values()):
             put("owner.notify_resolved", {"id": NOTE_ID})
-            for k in ("told", "told_at", "told_first", "told_first_at", "told_dup", "told_dup_at"):
-                st.pop(k, None)
-            st["hushed"] = conf["quiet_until"]
-        save_state(st)
-        return res
-    doubt = {n for n, s in servers.items() if s["state"] in ("later", "failed")}
-    first = {n: s for n, s in servers.items() if s["state"] == "first"}
-    said = [remember(st, "told", sorted(bad), now, doubt, REPEAT),
-            remember(st, "told_dup", sorted(d["name"] for d in res["dups"]), now, set()),
-            remember(st, "told_first", sorted(first), now, doubt)]
+        for a in al.values():
+            if a.get("told"):
+                a["open"], a["at"] = False, 0
+        st["hushed"] = conf["quiet_until"]
     use = in_use(hub_st)
-    if not st.get("split"):   # 0.1.0 told the owner of duplicates and first logins too: lift that once
-        if not st.get("told"):
-            put("owner.notify_resolved", {"id": NOTE_ID})
-        st["split"] = True
-    # the owner - only a login that worked and stopped: one urgent message, the most important first
-    if said[0] == "tell":
+    names, resolve = alarms_step(st, servers, bad, conf, now, hold)
+    if names:   # the owner - only a login that worked and stopped: one urgent message, the most important first
         put("owner.notify", {"id": NOTE_ID, "title": tr("title"), "topic": tr("lost_topic"),
-                             "text": message(bad, {}, [], conf, use, ok_at), "urgent": True, "urgency": "now"})
-        res["sessions"] = tell_sessions(order(bad, conf, use, ok_at), use, st, now)
-    elif said[0] == "resolve":
+                             "text": message({n: bad[n] for n in names}, [], conf, use, ok_at), "urgent": True,
+                             "urgency": "now"})
+        res["sessions"] = tell_sessions(order(names, conf, use, ok_at), use, st, now)
+    elif resolve:
         put("owner.notify_resolved", {"id": NOTE_ID})
-    # a duplicate and a never-made login block no work: one line a day to the Hub Developer, not to the owner
-    if "tell" in said[1:]:
-        dups = res["dups"] if said[1] == "tell" else []
-        firsts = first if said[2] == "tell" else {}
+    # a duplicate blocks no work: one line a day to the Hub Developer, not to the owner
+    if remember(st, "told_dup", sorted(d["name"] for d in res["dups"]), now, set()) == "tell":
         res["developer"] = developer(hub_st)
-        put("message.received", {"to": res["developer"], "text": message({}, firsts, dups, conf, use, ok_at)})
+        put("message.received", {"to": res["developer"], "text": message({}, res["dups"], conf, use, ok_at)})
     save_state(st)
     return res
 
@@ -849,12 +914,12 @@ def report(res):
     if res.get("later_all"):
         print(time.strftime("%H:%M:%S"), "mcp-keeper: later -", res.get("why"), flush=True)
         return
-    print(time.strftime("%H:%M:%S"), "mcp-keeper: live:", pick("ok"), "| lost:", pick("lost"), "| first login:",
-          pick("first"), "| not connecting:", pick("failed"), "| later:", pick("later"), "| duplicates:",
-          ", ".join(d["name"] for d in res.get("dups") or []) or "-", flush=True)
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: live:", pick("ok"), "| lost:", pick("lost"), "| later:", pick("later"),
+          "| duplicates:", ", ".join(d["name"] for d in res.get("dups") or []) or "-", flush=True)
 
 
 def loop():
+    start_clean()
     write_status(load_state())   # the view has its data right after a market update replaced the folder
     if time.time() - float(load_state().get("at") or 0) >= AGAIN_AFTER:
         time.sleep(START_DELAY)
@@ -874,6 +939,7 @@ def main():
     except Exception:   # noqa: BLE001
         pass
     if "--once" in sys.argv[1:]:
+        start_clean()
         report(once())
         return 0
     loop()
