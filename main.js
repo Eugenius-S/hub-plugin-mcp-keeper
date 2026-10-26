@@ -1,4 +1,4 @@
-// MCP logins: the last status the plugin process posted to its channel (a summary line + JSON).
+// MCP logins: the plugin process writes status.json next to this file every pass; the channel gets a human line.
 const NAME = "mcp-keeper";
 const STR = {
   en: {
@@ -20,23 +20,12 @@ const ORDER = { lost: 0, first: 1, failed: 2, later: 3, ok: 4, idle: 5 };
 const COLOR = { lost: "#e5484d", first: "#f5a524", failed: "#f5a524", later: "#8b8d98", ok: "#30a46c", idle: "#8b8d98" };
 
 let hub;
-let last = { id: 0, data: null };
+let last = { id: 0, at: 0, data: null };
 
 function tr(key, params = {}) {
   const table = Object.hasOwn(STR, hub.lang) ? STR[hub.lang] : STR.en;
   const text = Object.hasOwn(table, key) ? table[key] : STR.en[key];
   return text.replace(/\{(\w+)\}/g, (_, k) => String(params[k] ?? ""));
-}
-
-export function parse(text) {
-  const nl = String(text || "").indexOf("\n");
-  if (nl < 0) return null;
-  try {
-    const data = JSON.parse(text.slice(nl + 1));
-    return data && typeof data.servers === "object" ? data : null;
-  } catch {
-    return null;
-  }
 }
 
 function when(sec) {
@@ -46,16 +35,12 @@ function when(sec) {
 
 async function load(snap) {
   const top = Number((snap && snap.feeds && snap.feeds[NAME]) || 0);
-  if (top && top === last.id) return false;
-  const posts = await hub.feed(0);
-  for (let i = posts.length - 1; i >= 0; i--) {
-    const data = parse(posts[i].text);
-    if (data) {
-      last = { id: top || Number(String(posts[i].id).slice(1)), data };
-      return true;
-    }
-  }
-  return false;
+  if (last.data && top === last.id && Date.now() - last.at < 60000) return false;
+  const r = await fetch(new URL("status.json", import.meta.url), { cache: "no-store" });
+  const data = r.ok ? await r.json() : null;
+  const changed = JSON.stringify(data) !== JSON.stringify(last.data);
+  last = { id: top, at: Date.now(), data: data && typeof data.servers === "object" ? data : null };
+  return changed;
 }
 
 function draw(root) {

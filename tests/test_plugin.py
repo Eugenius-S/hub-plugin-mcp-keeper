@@ -9,6 +9,7 @@ os.environ["HUB_CONFIG"] = os.path.join(TMP, "hub.json")
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(TMP, "claude")
 os.environ["MCP_KEEPER_CREDS"] = os.path.join(TMP, "creds.json")
 os.environ["HUB_CLAUDE"] = os.path.join(TMP, "claude.sh")
+os.environ["MCP_KEEPER_STATUS"] = os.path.join(TMP, "status.json")
 os.environ.pop("HUB_EXTENSION", None)
 sys.path.insert(0, ROOT)
 import main  # noqa: E402
@@ -48,7 +49,8 @@ class Base(unittest.TestCase):
             self.addCleanup(p.stop)
         self.probes = {}
         self.clock = 100_000.0
-        self.hub = {"sessions": {"hub": {"kind": "hub", "state": "idle"},
+        self.hub = {"system": ["hub-dev"], "sessions": {"hub": {"kind": "hub", "state": "idle"},
+                                 "hub-dev": {"state": "idle"},
                                  "worker": {"state": "busy", "info": {"mcp": ["canva", "figma"]}},
                                  "sleepy": {"state": "parked", "info": {"mcp": ["canva"]}}}}
         main.CALM.shaken = self.clock - 10 * main.COOLDOWN   # a settled machine
@@ -68,6 +70,9 @@ class Base(unittest.TestCase):
     def notes(self):
         return [d for t, d in self.facts if t == "owner.notify"]
 
+    def dev(self):
+        return [d for t, d in self.facts if t == "message.received" and d["to"] == "hub-dev"]
+
     def run_once(self, now=NOW):
         self.facts.clear()
         return main.once(now)
@@ -84,6 +89,15 @@ class Parse(Base):
                               + "old: npx old (stdio) - Disabled\n")
         self.assertEqual(got, {"canva": "auth", "figma": "connected", "plugin:slack:slack": "failed"})
 
+    def test_connected_with_slow_tool_list_is_live(self):
+        # after a hub restart: the login was taken, only the tool list timed out - live, not "does not connect"
+        got = main.parse_list("github: https://g/mcp/ (HTTP) - ! Connected · tools fetch failed — Request timed out\n"
+                              "x: npx -y mcp-remote https://x - ✘ Failed to connect — MCP server \"x\" connection "
+                              "timed out after 30000ms\n")
+        self.assertEqual(got, {"github": "connected", "x": "failed"})
+        self.lists = ["canva: https://c (HTTP) - ! Connected · tools fetch failed — Request timed out\n"]
+        self.assertEqual(self.run_once()["servers"]["canva"]["state"], "ok")
+
 
 class Pass(Base):
     def test_all_live_no_alarm_and_status_post(self):
@@ -92,9 +106,16 @@ class Pass(Base):
         self.assertEqual({n: s["state"] for n, s in res["servers"].items()}, {"canva": "ok", "figma": "ok"})
         self.assertEqual(self.notes(), [])
         posts = [d for t, d in self.facts if t == "ext.post"]
-        self.assertEqual(posts[0]["plugin"], "mcp-keeper")
-        data = json.loads(posts[0]["text"].split("\n", 1)[1])
-        self.assertEqual(data["servers"]["canva"]["state"], "ok")
+        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 2 live, 0 lost, 0 later"}])   # a human line only
+        with open(os.environ["MCP_KEEPER_STATUS"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["servers"]["canva"]["state"], "ok")   # the view's data - the file
+        self.run_once(NOW + 900)
+        self.assertEqual([t for t, d in self.facts if t == "ext.post"], [])   # same picture - no new post
+
+    def test_first_login_is_not_counted_as_lost(self):
+        self.lists = [L_OK + "mobbin: https://m (HTTP) - ! Needs authentication\n"]
+        self.run_once()
+        self.assertEqual([d["text"] for t, d in self.facts if t == "ext.post"], ["MCP: 2 live, 0 lost, 0 later"])
 
     def test_lost_after_live_is_urgent_one_message_and_repeats_hourly(self):
         self.lists = [L_OK]
@@ -183,15 +204,28 @@ class Pass(Base):
         self.assertTrue(lines[1].startswith("• canva"), lines)    # one-time login first
         self.assertTrue(lines[2].startswith("• figma"), lines)    # then the one a working session uses
 
-    def test_first_login_is_not_urgent_and_plugin_server_is_silent(self):
+    def test_first_login_goes_to_hub_developer_once_a_day_and_plugin_server_is_silent(self):
         self.lists = ["newone: https://n (HTTP) - ! Needs authentication\n"
                       "plugin:x:x: https://p (HTTP) - ! Needs authentication\n"]
         res = self.run_once(NOW)
         self.assertEqual(res["servers"]["plugin:x:x"]["state"], "idle")
-        notes = self.notes()
-        self.assertEqual(len(notes), 1)
-        self.assertFalse(notes[0]["urgent"])
-        self.assertIn("newone", notes[0]["text"])
+        self.assertEqual(self.notes(), [])   # blocks no work: not the owner
+        dev = self.dev()
+        self.assertEqual(len(dev), 1)
+        self.assertIn("newone", dev[0]["text"])
+        self.assertNotIn("plugin:x:x", dev[0]["text"])
+        self.run_once(NOW + 3600)
+        self.assertEqual(self.dev(), [])
+        self.run_once(NOW + main.DAY + 1)
+        self.assertEqual(len(self.dev()), 1)
+
+    def test_old_owner_notice_of_0_1_0_is_lifted_once(self):
+        write(os.path.join(main.HOME, "state.json"), {"told_dup": ["figma"], "told_first": ["mobbin"]})
+        self.lists = [L_OK]
+        self.run_once(NOW)
+        self.assertIn(("owner.notify_resolved", {"id": "mcp"}), self.facts)
+        self.run_once(NOW + 900)
+        self.assertNotIn(("owner.notify_resolved", {"id": "mcp"}), self.facts)
 
     def test_ignore_lists(self):
         write(os.environ["HUB_CONFIG"], {"mcp_auth_ignore": ["canva"],
@@ -227,7 +261,10 @@ class Pass(Base):
         self.assertEqual(main.duplicates(), [{"name": "canva", "plugin": "plugin:canva:canva"}])
         self.lists = [L_OK]
         self.run_once(NOW)
-        self.assertIn("claude mcp remove canva -s user", self.notes()[0]["text"])
+        self.assertEqual(self.notes(), [])   # a duplicate is the Hub Developer's, not an urgent alarm to the owner
+        self.assertIn("claude mcp remove canva -s user", self.dev()[0]["text"])
+        self.run_once(NOW + 900)
+        self.assertEqual(self.dev(), [])   # once a day
 
 
 class Strings(unittest.TestCase):

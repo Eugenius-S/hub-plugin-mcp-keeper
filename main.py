@@ -47,7 +47,6 @@ NET_STEP = 30
 MAX_WAIT = 1800
 TRIES = 3
 LIST_TIMEOUT = 300
-STATUS_EVERY = 3600       # status post to the channel at least this often
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
 UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" to Python-urllib
@@ -306,7 +305,9 @@ def parse_list(text):
         name, status = m.group(1), m.group(2).lower()
         if "disabled" in status:
             continue
-        out[name] = ("connected" if "connected" in status and "fail" not in status
+        # "! Connected · tools fetch failed - Request timed out": the login was taken, only the tool list was slow
+        # (load right after a hub restart) - live; "✘ Failed to connect" - does not connect at all
+        out[name] = ("failed" if "failed to connect" in status else "connected" if "connected" in status
                      else "auth" if "auth" in status else "failed")
     return out
 
@@ -715,19 +716,30 @@ def message(bad, first, dups, conf, use, ok_at):
     return "\n".join(lines)
 
 
+def status_path():
+    """status.json next to the plugin: the page reads it from /ext/<plugin>/status.json (no-cache)."""
+    return os.environ.get("MCP_KEEPER_STATUS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "status.json")
+
+
+def write_status(st):
+    """The view's data - from the plugin state (a market update replaces the folder: rewritten at start too)."""
+    if st.get("status"):
+        write_json(status_path(), st["status"])
+
+
 def post_status(st, res, conf, now):
-    """Status to the plugin channel when it changed, or hourly: the view draws the last post."""
+    """Rows for the view (status.json) every pass; one human line to the plugin channel when the picture changed."""
     ok_at = st.setdefault("ok_at", {})
     rows = {n: {"state": s["state"], "ok_at": ok_at.get(n), **({"why": s["why"]} if s.get("why") else {})}
             for n, s in sorted(res["servers"].items())}
-    shape = json.dumps({n: r["state"] for n, r in rows.items()}, sort_keys=True)
-    if shape == st.get("posted") and now - float(st.get("posted_at") or 0) < STATUS_EVERY:
-        return False
+    st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}
+    write_status(st)
     count = lambda *states: sum(r["state"] in states for r in rows.values())
-    head = tr("status", ok=count("ok"), bad=count("lost", "first"), later=count("later", "failed"))
-    body = json.dumps({"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}, ensure_ascii=False)
-    put("ext.post", {"plugin": NAME, "text": head + "\n" + body})
-    st["posted"], st["posted_at"] = shape, now
+    head = tr("status", ok=count("ok"), bad=count("lost"), later=count("later", "failed"))
+    if head == st.get("posted"):
+        return False
+    put("ext.post", {"plugin": NAME, "text": head})
+    st["posted"], st["posted_at"] = head, now
     return True
 
 
@@ -779,17 +791,34 @@ def once(now=None):
             remember(st, "told_dup", sorted(d["name"] for d in res["dups"]), now, set()),
             remember(st, "told_first", sorted(first), now, doubt)]
     use = in_use(hub_st)
-    if "tell" in said:   # everything at once, one message, the most important first
-        text = message(bad, first, res["dups"], conf, use, ok_at)
-        put("owner.notify", {"id": NOTE_ID, "title": tr("title"), "topic": tr("lost_topic" if bad else "note_topic"),
-                             "text": text, "urgent": bool(bad or res["dups"]),
-                             **({"urgency": "now"} if bad or res["dups"] else {})})
-        if said[0] == "tell":
-            res["sessions"] = tell_sessions(order(bad, conf, use, ok_at), use, st, now)
-    elif not (st.get("told") or st.get("told_dup") or st.get("told_first")) and "resolve" in said:
+    if not st.get("split"):   # 0.1.0 told the owner of duplicates and first logins too: lift that once
+        if not st.get("told"):
+            put("owner.notify_resolved", {"id": NOTE_ID})
+        st["split"] = True
+    # the owner - only a login that worked and stopped: one urgent message, the most important first
+    if said[0] == "tell":
+        put("owner.notify", {"id": NOTE_ID, "title": tr("title"), "topic": tr("lost_topic"),
+                             "text": message(bad, {}, [], conf, use, ok_at), "urgent": True, "urgency": "now"})
+        res["sessions"] = tell_sessions(order(bad, conf, use, ok_at), use, st, now)
+    elif said[0] == "resolve":
         put("owner.notify_resolved", {"id": NOTE_ID})
+    # a duplicate and a never-made login block no work: one line a day to the Hub Developer, not to the owner
+    if "tell" in said[1:]:
+        dups = res["dups"] if said[1] == "tell" else []
+        firsts = first if said[2] == "tell" else {}
+        res["developer"] = developer(hub_st)
+        put("message.received", {"to": res["developer"], "text": message({}, firsts, dups, conf, use, ok_at)})
     save_state(st)
     return res
+
+
+def developer(st):
+    """The Hub Developer (the core names system agents, the first one) - or the hub session."""
+    sessions = st.get("sessions") or {}
+    for name in st.get("system") or []:
+        if (sessions.get(name) or {}).get("state") not in (None, "removed"):
+            return name
+    return hub_session(st)
 
 
 def tell_sessions(names, use, st, now):
@@ -820,6 +849,7 @@ def report(res):
 
 
 def loop():
+    write_status(load_state())   # the view has its data right after a market update replaced the folder
     if time.time() - float(load_state().get("at") or 0) >= AGAIN_AFTER:
         time.sleep(START_DELAY)
         report(once())
