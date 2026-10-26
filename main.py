@@ -411,8 +411,14 @@ def fingerprint(server):
 
 def duplicates():
     """[{name, plugin}] - a user server of ~/.claude.json with the address of an enabled plugin's server: Claude Code
-    loads the user one, the plugin's login under plugin:... is never refreshed and sessions see "needs login"."""
+    loads the user one, the plugin's login under plugin:... is never refreshed and sessions see "needs login".
+    Not a duplicate: a name the hub catalog serves (hub.json mcp.<name>.server) - hub sessions run with
+    --strict-mcp-config, never read ~/.claude.json, and core/catalog.launch_flags drops the plugin's twin in favour of
+    the catalog server, so the user-scope entry hides nothing there."""
     cj = read_json(claude_json()) or {}
+    catalog = (config() or {}).get("mcp")
+    served = {n for n, v in (catalog.items() if isinstance(catalog, dict) else [])
+              if isinstance(v, dict) and isinstance(v.get("server"), dict)}
     user = cj.get("mcpServers") if isinstance(cj.get("mcpServers"), dict) else {}
     plugins = {}
     for n, v in sorted(plugin_servers().items()):
@@ -420,7 +426,7 @@ def duplicates():
         if fp:
             plugins.setdefault(fp, n)
     return [{"name": n, "plugin": plugins[fingerprint(v)]} for n, v in sorted(user.items())
-            if fingerprint(v) and fingerprint(v) in plugins]
+            if n not in served and fingerprint(v) and fingerprint(v) in plugins]
 
 
 # ───── network ─────

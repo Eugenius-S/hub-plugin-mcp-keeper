@@ -266,6 +266,30 @@ class Pass(Base):
         self.run_once(NOW + 900)
         self.assertEqual(self.dev(), [])   # once a day
 
+    def plugin_with(self, name, plugin_url, user):
+        d = os.environ["CLAUDE_CONFIG_DIR"]
+        inst = os.path.join(TMP, "plug-" + name)
+        write(os.path.join(inst, ".mcp.json"), {"mcpServers": {name: {"type": "http", "url": plugin_url,
+                                                                      "headers": {"X-Figma-Plugin-Bundle": "1"}}}})
+        write(os.path.join(d, "settings.json"), {"enabledPlugins": {name + "@market": True}})
+        write(os.path.join(d, "plugins", "installed_plugins.json"), {"plugins": {name + "@market": [{"installPath": inst}]}})
+        write(os.path.join(d, ".claude.json"), {"mcpServers": {name: user}})
+
+    def test_catalog_server_is_not_a_duplicate(self):
+        # hub sessions run with --strict-mcp-config and get the catalog server; core/catalog.launch_flags drops the
+        # plugin's twin, so the user-scope server hides nothing there. Headers do not matter, the address does.
+        self.plugin_with("figma", "https://mcp.figma.com/mcp", {"type": "http", "url": "https://mcp.figma.com/mcp",
+                                                                "headers": {"Authorization": "Bearer x"}})
+        write(os.environ["HUB_CONFIG"], {"language": "en", "mcp": {"figma": {"server": {"url": "https://mcp.figma.com/mcp"}}}})
+        self.assertEqual(main.duplicates(), [])
+        write(os.environ["HUB_CONFIG"], {"language": "en", "mcp": {"figma": {"description": "no server"}}})
+        self.assertEqual(main.duplicates(), [{"name": "figma", "plugin": "plugin:figma:figma"}])
+
+    def test_no_catalog_entry_stays_a_duplicate(self):
+        self.plugin_with("canva", "https://mcp.canva.com/mcp", {"type": "http", "url": "https://mcp.canva.com/mcp?x=1"})
+        write(os.environ["HUB_CONFIG"], {"language": "en", "mcp": {"figma": {"server": {"url": "https://mcp.figma.com/mcp"}}}})
+        self.assertEqual(main.duplicates(), [{"name": "canva", "plugin": "plugin:canva:canva"}])
+
 
 class Strings(unittest.TestCase):
     def test_same_keys_in_every_language(self):
