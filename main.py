@@ -32,8 +32,16 @@ Out: the fact ext.<name>.checked, owner.notify (urgent - a quiet Telegram summar
 to the sessions that are working with this server right now, and the status in the plugin's channel (for its view).
 The state files hold server names, states and times only - no command lines, arguments, headers or addresses.
 
+cover (off by default; true or a list of machine names): every MCP server of this machine - the hub catalog,
+~/.claude.json, enabled plugins - each with its holder (by): claude, headers, conduit (read only: the hub's conduit
+module refreshes it, a parallel refresh kills the pair), mcp-remote / auth-keeper (stdio with mcp-remote: its stored
+login in ~/.mcp-auth is read, never exchanged), program (any other stdio: skipped, never started), local, none. A loss
+then goes at once to the Hub Developer (hub send), to the owner only after owner_after_passes (2) more passes, never one
+auth-keeper holds (it tells the owner itself). Refreshing ahead is not done: `claude mcp get` does not refresh a live
+access, Claude Code keeps the login itself under mcp-refresh-*.lock.
+
 Settings - hub.json extensions[<plugin>]: every_minutes (15), warn_days (3), ignore ([names]), one_time ([names]),
-max_alarms (6 a day), ask_claude (true), net_check_minutes (5), stale_days (2), check_duplicates (false), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
+max_alarms (6 a day), ask_claude (true), net_check_minutes (5), stale_days (2), check_duplicates (false), cover (false), owner_after_passes (2), read_only ([names]), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
 timezone); hub.json mcp_auth_ignore is honoured too.
 """
 import datetime, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -66,7 +74,10 @@ NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
 UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" to Python-urllib
 HELPER_TIMEOUT = 30       # a headersHelper run over this is killed: "later"
-STATES = ("ok", "lost", "later", "first")
+STATES = ("ok", "lost", "later", "first", "skip")
+HOLDERS = ("claude", "headers", "conduit", "auth-keeper", "mcp-remote", "program", "none", "local")
+OWNER_AFTER = 2           # cover: the owner hears of a loss only when this many more passes still see it
+READ_ONLY = ("conduit",)  # cover: logins another part of the hub refreshes - only looked at, never through claude
 LIVE = ("idle", "busy", "dialog")   # sessions with a process: their MCP status is Claude Code's own fresh word
 
 STR = {
@@ -97,6 +108,17 @@ STR = {
         "why_helper_out": "the headersHelper printed no headers",
         "why_headers": "the server rejects the headers (HTTP {code})",
         "fix_headers": "renew the key of hub.json mcp.{name}.server",
+        "fix_mcp": "/mcp in Claude Code -> {name}",
+        "first_line_fix": "\u2022 {name}: {fix}",
+        "why_local": "a server on this machine: no login",
+        "why_open": "the server answers without a login",
+        "why_program": "a program with its own login: not started, not checked",
+        "why_ms365": "a program with its own login: auth-keeper checks it (--verify-login)",
+        "why_read_only": "the access lives 15 minutes; the hub's conduit module refreshes it when it is used - only looked at",
+        "why_remote_expired": "the mcp-remote access has expired and auth-keeper did not refresh it ahead",
+        "why_remote_later": "the mcp-remote access has expired: mcp-remote refreshes it at its start",
+        "dev": "MCP: first sign of a lost login (the owner hears only if it stays lost for {passes} more passes):",
+        "dev_line": "\u2022 {name} ({by}) - {why}: {fix}",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает — хаб освежит его, когда сессия "
@@ -125,6 +147,17 @@ STR = {
         "why_helper_out": "headersHelper не выдал заголовков",
         "why_headers": "сервер отвергает заголовки (HTTP {code})",
         "fix_headers": "обнови ключ в hub.json mcp.{name}.server",
+        "fix_mcp": "/mcp в Claude Code -> {name}",
+        "first_line_fix": "\u2022 {name}: {fix}",
+        "why_local": "сервер на этой машине: входа нет",
+        "why_open": "сервер отвечает без входа",
+        "why_program": "программа со своим входом: не запускается, не проверяется",
+        "why_ms365": "программа со своим входом: её проверяет auth-keeper (--verify-login)",
+        "why_read_only": "доступ живёт 15 минут, его освежает модуль conduit хаба при использовании — только смотрим",
+        "why_remote_expired": "доступ mcp-remote истёк, auth-keeper не освежил его заранее",
+        "why_remote_later": "доступ mcp-remote истёк: mcp-remote освежит его при запуске",
+        "dev": "MCP: первый признак слёта входа (владелец узнает, только если не оживёт ещё {passes} прохода):",
+        "dev_line": "\u2022 {name} ({by}) — {why}: {fix}",
     },
 }
 
@@ -196,7 +229,22 @@ def settings():
             "max_alarms": max(1, int(own.get("max_alarms") or MAX_ALARMS)),
             "ask_claude": own.get("ask_claude", True) is not False,
             "check_duplicates": own.get("check_duplicates", False) is True,
+            "cover": cover_on(own.get("cover")),
+            "owner_after": max(0, int(own.get("owner_after_passes", OWNER_AFTER))),
+            "read_only": {short(x) for x in list(READ_ONLY) + list(own.get("read_only") or [])},
+            "auth_keeper": any(short(k) == "auth-keeper" and isinstance(v, dict) and not v.get("disabled")
+                               for k, v in (cfg.get("extensions") or {}).items()),
             "ignore": {str(x).lower() for x in list(own.get("ignore") or []) + list(skip if isinstance(skip, list) else [])}}
+
+
+def cover_on(value):
+    """cover: true, or a list of machine names (hub.json settings travel between machines: a list keeps it on one)."""
+    if value is True:
+        return True
+    if not isinstance(value, list):
+        return False
+    host = socket.gethostname().lower()
+    return any(str(x).lower() in (host, host.split(".")[0]) for x in value)
 
 
 def read_json(path):
@@ -599,18 +647,92 @@ def keyed(server):
                                                             if isinstance(head, dict))))
 
 
-def header_servers():
-    """{name: server} - headers servers the hub gives to its sessions (the hub catalog and plugins)."""
+def header_servers(cover=False):
+    """{name: server} - headers servers the hub gives to its sessions (the hub catalog and plugins); with cover - every
+    server of this machine (~/.claude.json too)."""
+    return {n: v for n, v in (cover_servers() if cover else hub_servers()).items() if keyed(v)}
+
+
+def catalog_servers():
     catalog = (config() or {}).get("mcp")
-    out = {}
-    for n, v in sorted((catalog if isinstance(catalog, dict) else {}).items()):
-        srv = v.get("server") if isinstance(v, dict) else None
-        if keyed(srv):
-            out[str(n)] = srv
+    return {str(n): v["server"] for n, v in sorted((catalog if isinstance(catalog, dict) else {}).items())
+            if isinstance(v, dict) and isinstance(v.get("server"), dict)}
+
+
+def hub_servers():
+    """{name: server} - the hub catalog, then servers of enabled plugins."""
+    out = dict(catalog_servers())
     for n, v in sorted(plugin_servers().items()):
-        if keyed(v):
-            out.setdefault(n, v)
+        out.setdefault(n, v)
     return out
+
+
+def user_servers():
+    """{name: server} of ~/.claude.json (user scope and every project), read only."""
+    cj = read_json(claude_json()) or {}
+    out = {}
+    blocks = [cj.get("mcpServers")] + [p.get("mcpServers") for p in (cj.get("projects") or {}).values() if isinstance(p, dict)]
+    for block in blocks:
+        for n, v in sorted((block if isinstance(block, dict) else {}).items()):
+            if isinstance(v, dict):
+                out.setdefault(str(n), v)
+    return out
+
+
+def cover_servers():
+    """{name: server} - every MCP server of this machine: the hub catalog, ~/.claude.json, enabled plugins; a server
+    under a second name (the same address or package) once, by its first name."""
+    out, prints = {}, set()
+    for block in (catalog_servers(), user_servers(), plugin_servers()):
+        for n, v in sorted(block.items()):
+            fp = fingerprint(v)
+            if n in out or (fp and fp in prints):
+                continue
+            out[n] = v
+            if fp:
+                prints.add(fp)
+    return out
+
+
+def local_url(url):
+    try:
+        return (urllib.parse.urlsplit(str(url).strip()).hostname or "") in LOCAL_HOSTS
+    except ValueError:
+        return False
+
+
+def remote_url(server):
+    """mcp-remote <https address> in a stdio server's args - its address, else None."""
+    args = [a for a in (server.get("args") or []) if isinstance(a, str)] if isinstance(server, dict) else []
+    if not any("mcp-remote" in a for a in args + [str(server.get("command") or "")]):
+        return None
+    return next((a for a in args if re.match(r"https?://", a)), None)
+
+
+def remote_tokens(url):
+    """The stored login of mcp-remote for this address: the newest <md5(url)>_tokens.json of
+    <MCP_REMOTE_CONFIG_DIR or ~/.mcp-auth>/mcp-remote-*/, read only (mcp-remote and auth-keeper refresh it)."""
+    base = os.environ.get("MCP_REMOTE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".mcp-auth")
+    name = hashlib.md5(url.encode()).hexdigest() + "_tokens.json"
+    found = glob.glob(os.path.join(glob.escape(base), "mcp-remote-*", name))
+    for path in sorted(found, key=lambda p: os.path.getmtime(p), reverse=True):
+        data = read_json(path)
+        if isinstance(data, dict):
+            exp = data.get("expires_at")
+            if isinstance(exp, (int, float)) and exp:
+                exp = exp / 1000 if exp > 1e11 else exp
+            elif isinstance(data.get("expires_in"), (int, float)):
+                exp = os.path.getmtime(path) + data["expires_in"]
+            else:
+                exp = 0
+            return {"access": data.get("access_token"), "refresh": bool(data.get("refresh_token")), "expires": exp}
+    return None
+
+
+def probe_open(url):
+    """Does the server answer an initialize without any login: True (2xx) / False (401, 403) / None."""
+    ok, code = probe_with(url, {"User-Agent": UA})
+    return True if ok and code and code < 300 else False if ok is False else None
 
 
 def expand(value):
@@ -656,7 +778,7 @@ def session_verdict(name, hub_st, live=True):
     return said
 
 
-def served(hub_st):
+def served(hub_st, cover=False):
     """{name: url or None} - remote servers the hub gives to its sessions: the hub catalog (hub.json mcp.<name>.server) and
     MCP servers of plugins (plugin:<plugin>:<server>). The MCP of Claude Code outside the hub (~/.claude.json) is not
     here, and a server that runs as a program (stdio) is never here: nothing is started to look at it."""
@@ -671,6 +793,11 @@ def served(hub_st):
     for n, v in sorted(plugin_servers().items()):
         if remote(v) and fingerprint(v) not in prints:   # the core drops the plugin's twin of a catalog server
             out.setdefault(n, v["url"])
+    if cover:   # every remote server of this machine, not only what the hub gives
+        have = {fingerprint({"url": u}) for u in out.values() if u}
+        for n, v in sorted(cover_servers().items()):
+            if remote(v) and n not in out and fingerprint(v) not in have:
+                out[n] = v["url"]
     for s in (hub_st.get("sessions") or {}).values():
         for n in (s.get("info") or {}).get("mcp") or []:
             if isinstance(n, str) and n.startswith("plugin:"):
@@ -680,7 +807,10 @@ def served(hub_st):
 
 # ───── one pass ─────
 
-def login_fix(server, hub):
+def login_fix(server, hub, catalog=None):
+    """The login command: the hub's for its catalog and plugins, /mcp of Claude Code for a server only it has."""
+    if catalog is not None and server not in catalog and not str(server).startswith("plugin:"):
+        return tr("fix_mcp", name=server)
     return f"hub mcp login {hub} {server}"
 
 
@@ -759,22 +889,36 @@ def checkup(conf, now, st, hub, hub_st):
     A live access is asked of the server itself (initialize); an expired one - of Claude Code, about this server only,
     and where it cannot tell (a hub catalog server) - of the hub's live sessions. A headers server - its helper runs
     and the server is asked with those headers. first - never logged in while sessions wait for it (not a loss)."""
-    ignore, had = conf["ignore"], set(st.get("had") or [])
+    ignore, had, cover = conf["ignore"], set(st.get("had") or []), conf.get("cover")
     entries = oauth_entries(credentials())
     out, logged = {}, []
-    for name, url in sorted(served(hub_st).items()):
+    catalog = set(catalog_servers()) if cover else None
+    for name, url in sorted(served(hub_st, cover).items()):
         if ignored(name, ignore):
+            continue
+        fix = login_fix(name, hub, catalog)
+        if cover and url and local_url(url):   # a server on this machine (a desktop app): nothing to log in to
+            out[name] = {"state": "skip", "why": tr("why_local"), "by": "local"}
             continue
         ent = entries.get(name) or {}
         has = bool(ent.get("accessToken") or ent.get("refreshToken"))
+        by = "conduit" if cover and short(name) in conf["read_only"] else "claude"
         if not has:
             if name in had:   # it was live with a stored login and the record is gone: something erased it
-                out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": login_fix(name, hub)}
+                out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": fix, "by": by}
             elif session_verdict(name, hub_st, live=False) == "auth":   # never logged in, and sessions wait for it
-                out[name] = {"state": "first", "why": tr("why_first"), "fix": login_fix(name, hub)}
+                out[name] = {"state": "first", "why": tr("why_first"), "fix": fix, "by": by}
+            elif cover and url:   # every server of the machine: one that needs no login, or one never logged in
+                ok = probe_open(url)
+                out[name] = ({"state": "skip", "why": tr("why_open"), "by": "none"} if ok
+                             else {"state": "first", "why": tr("why_first"), "fix": fix, "by": by} if ok is False
+                             else {"state": "later", "by": by})
             continue   # never logged in and nobody waits: a login nobody made is no loss
         logged.append(name)
-        lose = lambda why: {"state": "lost", "why": why, "fix": login_fix(name, hub)}
+        lose = lambda why: {"state": "lost", "why": why, "fix": fix, "by": by}
+        if by == "conduit":   # refreshed by the hub's conduit module when used: a parallel refresh kills the pair
+            out[name] = read_only_row(ent, now, lose)
+            continue
         expires = (ent.get("expiresAt") or 0) / 1000
         row = {"state": "later"}
         if ent.get("accessToken") and (not expires or expires > now + 60):
@@ -802,19 +946,71 @@ def checkup(conf, now, st, hub, hub_st):
             row = lose(tr("why_expired"))
         if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
             row = lose(tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
-        out[name] = row
-    for name, srv in sorted(header_servers().items()):
+        out[name] = {**row, "by": by} if cover else row
+    for name, srv in sorted(header_servers(cover).items()):
         if ignored(name, ignore) or name in out:
             continue
         head, why = helper_headers(srv)
-        fix = tr("fix_headers", name=name)
+        fix = tr("fix_headers", name=name) if name in catalog_servers() else tr("fix_mcp", name=name)
         if head is None:
-            out[name] = {"state": "later"} if why == "later" else {"state": "lost", "why": why, "fix": fix}
-            continue
-        ok, code = probe_keyed(srv["url"], head)
-        out[name] = ({"state": "lost", "why": tr("why_headers", code=code), "fix": fix} if ok is False
-                     else {"state": "ok"} if ok else {"state": "later"})
+            row = {"state": "later"} if why == "later" else {"state": "lost", "why": why, "fix": fix}
+        else:
+            ok, code = probe_keyed(srv["url"], head)
+            row = ({"state": "lost", "why": tr("why_headers", code=code), "fix": fix} if ok is False
+                   else {"state": "ok"} if ok else {"state": "later"})
+        out[name] = {**row, "by": "headers"} if cover else row
+    if cover:
+        programs(conf, now, out, logged, had, hub, catalog)
+    else:   # 0.3.0 rows: no holder
+        for r in out.values():
+            r.pop("by", None)
     return {"servers": out, "logged": logged, "later_all": False}
+
+
+def read_only_row(ent, now, lose):
+    """A login another part of the hub refreshes (conduit): a live access is asked of the server, an expired one with a
+    refresh token is the normal state between uses - never asked of claude, never refreshed here."""
+    expires = (ent.get("expiresAt") or 0) / 1000
+    if ent.get("accessToken") and (not expires or expires > now + 60):
+        ok, code = probe(ent)
+        return (lose(tr("why_rejected", code=code)) if ok is False else
+                {"state": "ok", "by": "conduit"} if ok else {"state": "later", "by": "conduit"})
+    if ent.get("refreshToken"):
+        return {"state": "skip", "why": tr("why_read_only"), "by": "conduit"}
+    return lose(tr("why_expired"))
+
+
+def programs(conf, now, out, logged, had, hub, catalog):
+    """cover: stdio servers - never started. mcp-remote: its stored login is read (never refreshed: mcp-remote does it
+    at its start, auth-keeper ahead); the Microsoft 365 program is auth-keeper's; any other program is skipped."""
+    for name, srv in sorted(cover_servers().items()):
+        if name in out or ignored(name, conf["ignore"]) or not isinstance(srv, dict) or not srv.get("command"):
+            continue
+        url = remote_url(srv)
+        holder = "auth-keeper" if conf["auth_keeper"] else "mcp-remote"
+        fix = login_fix(name, hub, catalog)
+        if url:
+            tok = remote_tokens(url)
+            if not tok or not (tok["access"] or tok["refresh"]):
+                out[name] = ({"state": "lost", "why": tr("why_wiped"), "fix": fix, "by": holder} if name in had
+                             else {"state": "first", "why": tr("why_first"), "fix": fix, "by": holder})
+                continue
+            logged.append(name)
+            if tok["access"] and (not tok["expires"] or tok["expires"] > now + 60):
+                ok, code = probe_with(url, {"Authorization": "Bearer " + tok["access"]})
+                out[name] = ({"state": "lost", "why": tr("why_rejected", code=code), "fix": fix, "by": holder}
+                             if ok is False else {"state": "ok" if ok else "later", "by": holder})
+            elif tok["refresh"] and conf["auth_keeper"]:   # it refreshes 2 h ahead: expired means it did not
+                out[name] = {"state": "lost", "why": tr("why_remote_expired"), "fix": fix, "by": holder}
+            elif tok["refresh"]:
+                out[name] = {"state": "later", "why": tr("why_remote_later"), "by": holder}
+            else:
+                out[name] = {"state": "lost", "why": tr("why_expired"), "fix": fix, "by": holder}
+        elif "ms-365-mcp-server" in json.dumps(srv.get("args") or []) + str(srv.get("command")):
+            out[name] = {"state": "skip", "by": "auth-keeper" if conf["auth_keeper"] else "program",
+                         "why": tr("why_ms365") if conf["auth_keeper"] else tr("why_program")}
+        else:
+            out[name] = {"state": "skip", "why": tr("why_program"), "by": "program"}
 
 
 def lost(res):
@@ -825,7 +1021,7 @@ def confirmed(first, now, conf, st, hub, hub_st):
     """A new loss - a second pass CONFIRM_AFTER later, on a calm network: only what is lost both times. None - it shook
     in between: the pass does not count."""
     fresh = {n for n in lost(first) if not (st.get("alarms") or {}).get(n, {}).get("open")}
-    if not fresh:
+    if not fresh or conf.get("cover"):   # cover: the passes of the ladder confirm it, the first sign goes out now
         return first
     if not CALM.wait(CONFIRM_AFTER):
         return None
@@ -974,7 +1170,7 @@ def clean_status(data):
         if isinstance(r, dict) and r.get("state") in STATES:
             why = r.get("why") if isinstance(r.get("why"), str) and len(r["why"]) <= 160 and "://" not in r["why"] else None
             rows[str(n)] = {"state": r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
-                            **({"why": why} if why else {})}
+                            **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY, "servers": rows}
 
 
@@ -1016,7 +1212,8 @@ def start_clean():
 def post_status(st, res, conf, now):
     """Rows for the view (status.json) every pass; one human line to the plugin channel when the picture changed."""
     ok_at = st.setdefault("ok_at", {})
-    rows = {n: {"state": s["state"], "ok_at": ok_at.get(n), **({"why": s["why"]} if s.get("why") else {})}
+    rows = {n: {"state": s["state"], "ok_at": ok_at.get(n), **({"why": s["why"]} if s.get("why") else {}),
+                **({"by": s["by"]} if s.get("by") else {})}
             for n, s in sorted(res["servers"].items())}
     st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}
     write_status(st)
@@ -1055,6 +1252,7 @@ def once(now=None):
     put(f"ext.{NAME}.checked", {"ok": sorted(n for n, s in servers.items() if s["state"] == "ok"),
                                 "lost": [{"name": n, "why": s.get("why")} for n, s in sorted(bad.items())],
                                 "later": sorted(n for n, s in servers.items() if s["state"] in ("later", "failed")),
+                                "skip": sorted(n for n, s in servers.items() if s["state"] == "skip"),
                                 "dups": res["dups"]})
     post_status(st, res, conf, now)
     al = st.setdefault("alarms", {})
@@ -1073,7 +1271,10 @@ def once(now=None):
                 a["open"], a["at"] = False, 0
         st["hushed"] = conf["quiet_until"]
     use = in_use(hub_st)
-    names, resolve = alarms_step(st, servers, bad, conf, now, hold)
+    owner_bad = bad
+    if conf["cover"]:   # the Hub Developer at the first sign, the owner only when it stays lost
+        owner_bad = ladder(st, servers, bad, conf, now, hub_st, res)
+    names, resolve = alarms_step(st, servers, owner_bad, conf, now, hold)
     if names:   # the owner - only a login that worked and stopped: one urgent message, the most important first
         put("owner.notify", {"id": NOTE_ID, "title": tr("title"), "topic": tr("lost_topic"),
                              "text": message({n: bad[n] for n in names}, [], conf, use, ok_at), "urgent": True,
@@ -1090,9 +1291,35 @@ def once(now=None):
     if remember(st, "told_never", first, now, set()) == "tell":
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"], "text": "\n".join(
-            [tr("first", names=", ".join(first))] + [tr("first_line", name=n, hub=hub) for n in first])})
+            [tr("first", names=", ".join(first))] + [tr("first_line_fix", name=n, fix=servers[n].get("fix") or
+                                                        login_fix(n, hub)) for n in first])})
     save_state(st)
     return res
+
+
+def ladder(st, servers, bad, conf, now, hub_st, res):
+    """cover: a lost login goes to the Hub Developer at once (what is seen, the holder, the fix; again not within a day),
+    to the owner only after `owner_after` more passes still see it lost, never one auth-keeper holds (it tells the owner
+    itself). A pass that cannot tell (later) neither counts nor resets. Returns the servers for the owner's alarm."""
+    streak, warned = st.setdefault("streak", {}), st.setdefault("dev_warned", {})
+    for n in list(streak):
+        if n not in bad and (servers.get(n) or {}).get("state") != "later":
+            del streak[n]
+    for n in list(warned):
+        if (servers.get(n) or {}).get("state") in (None, "ok", "skip", "first"):
+            del warned[n]
+    for n in bad:
+        streak[n] = streak.get(n, 0) + 1
+    new = sorted(n for n in bad if now - warned.get(n, -DAY) >= DAY)
+    if new:
+        res["developer"] = developer(hub_st)
+        put("message.received", {"to": res["developer"], "text": "\n".join(
+            [tr("dev", passes=conf["owner_after"])] +
+            [tr("dev_line", name=n, by=bad[n].get("by") or "-", why=bad[n].get("why") or "-", fix=bad[n].get("fix") or "-")
+             for n in new])})
+        for n in new:
+            warned[n] = now
+    return {n: s for n, s in bad.items() if streak[n] > conf["owner_after"] and s.get("by") != "auth-keeper"}
 
 
 def developer(st):
@@ -1127,6 +1354,7 @@ def report(res):
         print(time.strftime("%H:%M:%S"), "mcp-keeper: later -", res.get("why"), flush=True)
         return
     print(time.strftime("%H:%M:%S"), "mcp-keeper: live:", pick("ok"), "| lost:", pick("lost"), "| later:", pick("later"),
+          "| first:", pick("first"), "| skip:", pick("skip"),
           "| duplicates:", ", ".join(d["name"] for d in res.get("dups") or []) or "-", flush=True)
 
 

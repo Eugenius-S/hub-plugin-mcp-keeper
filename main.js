@@ -6,16 +6,18 @@ const STR = {
     server: "Server", state: "State", ok_at: "Last live", checked: "Checked {when}",
     none: "No pass yet: the first one goes a minute after the start, after a calm network.",
     ok: "live", lost: "login lost", later: "check later", first: "never logged in", never: "never",
+    skip: "not checked", by: "Held by",
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
     server: "Сервер", state: "Состояние", ok_at: "Последний раз жив", checked: "Проверено {when}",
     none: "Прохода ещё не было: первый — через минуту после старта, при спокойной сети.",
     ok: "жив", lost: "слетел вход", later: "проверить позже", first: "ещё не входили", never: "никогда",
+    skip: "не проверяется", by: "Кто держит",
   },
 };
-const ORDER = { lost: 0, first: 1, later: 2, ok: 3 };
-const COLOR = { lost: "#e5484d", first: "#f5a524", later: "#8b8d98", ok: "#30a46c" };
+const ORDER = { lost: 0, first: 1, later: 2, ok: 3, skip: 4 };
+const COLOR = { lost: "#e5484d", first: "#f5a524", later: "#8b8d98", ok: "#30a46c", skip: "#8b8d98" };
 
 let hub;
 let last = { id: 0, at: 0, data: null };
@@ -55,7 +57,8 @@ function draw(root) {
   const table = hub.el("table", "mk-table");
   table.style.cssText = "border-collapse:collapse;width:100%";
   const head = hub.el("tr");
-  for (const k of ["server", "state", "ok_at"]) {
+  const by = Object.values(d.servers).some((s) => s.by);
+  for (const k of by ? ["server", "state", "by", "ok_at"] : ["server", "state", "ok_at"]) {
     const th = hub.el("th", "", tr(k));
     th.style.cssText = "text-align:left;padding:6px 8px;opacity:.7;font-weight:500";
     head.append(th);
@@ -73,6 +76,7 @@ function draw(root) {
     cell(name, "font-family:ui-monospace,monospace");
     const st = cell((Object.hasOwn(STR.en, s.state) ? tr(s.state) : s.state) + (s.why ? ": " + s.why : ""));
     st.style.color = COLOR[s.state] || "";
+    if (by) cell(s.by || "", "font-family:ui-monospace,monospace;opacity:.8");
     cell(when(s.ok_at));
     table.append(tr_);
   }

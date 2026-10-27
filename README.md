@@ -59,6 +59,37 @@ network without sleep (the idle loop looks at the clock every 30 s, at the netwo
   in" and the Hub Developer gets one line a day with one `hub mcp login` per server (one login is enough for every
   session).
 
+## Cover: every login of the machine (off by default)
+
+`cover: true` (or a list of machine names: `["my-mac.local"]` - hub.json settings may travel between machines) widens
+the watch from what the hub gives its sessions to every MCP server of this machine: the hub catalog, `~/.claude.json`
+(user and project scope) and enabled plugins. Each server gets a state and who holds its login (`by` in the view):
+
+| Server | State | Held by |
+|---|---|---|
+| OAuth (http) | live access - `initialize`; expired - `claude mcp get` (never for a one-time one) | `claude` |
+| headers / headersHelper | the helper, then `initialize` with its headers | `headers` |
+| read-only logins (`conduit`, `read_only` adds) | live access - `initialize`; expired with a refresh token - normal between uses, never asked of `claude` | `conduit` |
+| stdio with `mcp-remote <url>` | its stored login in `~/.mcp-auth` (read only, never exchanged), live access - `initialize` | `auth-keeper` when that plugin is on, else `mcp-remote` |
+| Microsoft 365 program | skipped: auth-keeper runs its `--verify-login` | `auth-keeper` |
+| any other stdio program | skipped, never started; the reason is in `status.json` | `program` |
+| a server on this machine (localhost) / one that answers without a login | skipped | `local` / `none` |
+
+`mcp_auth_ignore` and `ignore` hold. A server under a second name (the same address or package) is checked once.
+
+The alarm has steps with `cover`: the first sign of a lost login goes at once to the Hub Developer (`hub send`, what
+is seen, who holds it, the fix; not again within a day); the owner gets the urgent message only when
+`owner_after_passes` (2, about 30 min) more passes still see it lost, then at most one alarm per server a day. A pass
+that cannot tell ("later") neither counts nor resets. A login auth-keeper holds goes to the Hub Developer only:
+auth-keeper tells the owner itself.
+
+## Refreshing ahead
+
+The plugin never refreshes a login ahead. `claude mcp get` does not refresh a live access - it is a check, not a
+renewal. Claude Code keeps its MCP logins itself: it refreshes an expired access when a session connects, under
+`~/.claude/mcp-refresh-<key>.lock`, re-reading the stored pair inside the lock. A second exchange next to it (the same
+minute, out of the lock) repeats a refresh token, and a one-time one is then revoked - so the plugin only reads.
+
 ## Duplicates (off by default)
 
 A user server in `~/.claude.json` with the address of a plugin's server hides the plugin's one from Claude Code
@@ -88,6 +119,9 @@ output, command lines, free-form status rows) are removed or rewritten at start.
 | `ask_claude` | `true` | `false` - never run `claude mcp get`, an expired access is "later" |
 | `check_duplicates` | `false` | one line a day about a user server that hides a plugin's one |
 | `quiet_until` | - | epoch or `YYYY-MM-DDTHH:MM` (hub timezone): no alarms until then |
+| `cover` | `false` | `true` or `[machine names]`: every MCP server of the machine, see "Cover" |
+| `owner_after_passes` | 2 | with `cover`: more passes a loss must last before the owner hears of it |
+| `read_only` | `[]` | servers to add to the built-in `conduit`: looked at, never asked of `claude` |
 
 The view "MCP logins" shows every server, its state and when it was last live (`status.json` next to the plugin).
 

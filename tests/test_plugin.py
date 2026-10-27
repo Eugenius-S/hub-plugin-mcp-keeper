@@ -925,6 +925,178 @@ class Headers(Base):
             self.assertEqual(main.probe_with("http://evil.example.com/mcp", {"Authorization": "x"}), (None, None))
 
 
+class Cover(Base):
+    """cover: every login of this machine (~/.claude.json, plugins), each with its holder; a loss goes to the Hub
+    Developer at the first sign and to the owner only when it stays lost for `owner_after_passes` more passes."""
+
+    REMOTE = "https://mcp.remote.example/mcp"
+
+    def setUp(self):
+        super().setUp()
+        write(os.path.join(TMP, "claude", ".claude.json"), {"mcpServers": {
+            "gate": {"type": "http", "url": "https://gate.example/mcp"},
+            "docs": {"type": "http", "url": "https://docs.example/mcp"},
+            "desk": {"type": "http", "url": "http://127.0.0.1:3845/mcp"},
+            "rem": {"type": "stdio", "command": "npx", "args": ["-y", "mcp-remote", self.REMOTE]},
+            "m365": {"type": "stdio", "command": "npx", "args": ["-y", "@softeria/ms-365-mcp-server"]},
+            "cli": {"type": "stdio", "command": "npx", "args": ["-y", "@canva/cli@latest", "mcp"]},
+            "figma": {"type": "http", "url": URLS["figma"]}}})
+        self.addCleanup(os.unlink, os.path.join(TMP, "claude", ".claude.json"))
+        os.environ["MCP_REMOTE_CONFIG_DIR"] = os.path.join(TMP, "mcp-auth")
+        self.addCleanup(os.environ.pop, "MCP_REMOTE_CONFIG_DIR", None)
+        self.open = {"https://docs.example/mcp": True, "https://gate.example/mcp": False}
+        p = mock.patch.object(main, "probe_open", lambda url: self.open.get(url))
+        p.start()
+        self.addCleanup(p.stop)
+        self.bearer = []
+        p = mock.patch.object(main, "probe_with", self.fake_with)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(main.subprocess, "Popen", side_effect=AssertionError("a server was started"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.on()
+
+    def gate(self):
+        """A live stored login of the user server gate, next to the live catalog ones."""
+        live = {n: {"serverUrl": u, "accessToken": "t", "refreshToken": "r", "expiresAt": (NOW + 3600) * 1000}
+                for n, u in URLS.items()}
+        self.creds(gate={"serverUrl": "https://gate.example/mcp", "accessToken": "g", "refreshToken": "r",
+                         "expiresAt": (NOW + 3600) * 1000}, **live)
+
+    def fake_with(self, url, head):
+        self.bearer.append(url)
+        return self.probes.get(url, (True, 200))
+
+    def on(self, value=True, **extra):
+        self.config({}, plugin={"cover": value, **extra})
+
+    def tokens(self, expires, access="a", refresh="r"):
+        import hashlib
+        write(os.path.join(TMP, "mcp-auth", "mcp-remote-v1", hashlib.md5(self.REMOTE.encode()).hexdigest() + "_tokens.json"),
+              {"access_token": access, "refresh_token": refresh, "expires_at": expires * 1000})
+
+    def test_off_by_default(self):
+        self.config({})
+        res = self.run_once()
+        for n in ("gate", "docs", "desk", "rem", "m365", "cli"):
+            self.assertNotIn(n, res["servers"])
+
+    def test_every_server_of_the_machine_has_a_state_and_a_holder(self):
+        self.tokens(NOW + 3600)
+        self.gate()
+        s = self.run_once()["servers"]
+        got = {n: (s[n]["state"], s[n].get("by")) for n in ("gate", "docs", "desk", "rem", "m365", "cli", "figma")}
+        self.assertEqual(got, {"gate": ("ok", "claude"), "docs": ("skip", "none"), "desk": ("skip", "local"),
+                               "rem": ("ok", "mcp-remote"), "m365": ("skip", "program"), "cli": ("skip", "program"),
+                               "figma": ("ok", "claude")})
+        self.assertTrue(all(s[n].get("why") for n in ("docs", "desk", "m365", "cli")))
+        status = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertEqual(status["servers"]["cli"]["state"], "skip")
+        self.assertEqual(status["servers"]["rem"]["by"], "mcp-remote")
+
+    def test_a_list_of_machines(self):
+        with mock.patch.object(main.socket, "gethostname", lambda: "Other-Box.local"):
+            self.on(["Mac-One.local"])
+            self.assertNotIn("gate", self.run_once()["servers"])
+            self.on(["other-box"])
+            self.assertIn("gate", self.run_once()["servers"])
+
+    def test_never_logged_in_user_server_is_first_not_lost(self):
+        s = self.run_once()["servers"]["gate"]
+        self.assertEqual((s["state"], s["fix"]), ("first", "/mcp in Claude Code -> gate"))
+        self.assertEqual(self.notes(), [])
+        self.assertIn("gate: /mcp in Claude Code -> gate", self.dev()[0]["text"])
+
+    def test_first_login_turns_ok(self):
+        self.assertEqual(self.run_once()["servers"]["gate"]["state"], "first")
+        self.gate()
+        res = self.run_once(NOW + 900)
+        self.assertEqual(res["servers"]["gate"]["state"], "ok")
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+
+    def test_conduit_is_only_looked_at(self):
+        self.creds(conduit={"serverUrl": "https://c/mcp", "accessToken": "c", "refreshToken": "r",
+                            "expiresAt": (NOW - 600) * 1000})
+        with mock.patch.object(main, "user_servers", lambda: {"conduit": {"type": "http", "url": "https://c/mcp"}}):
+            s = self.run_once()["servers"]["conduit"]
+        self.assertEqual((s["state"], s["by"]), ("skip", "conduit"))
+        self.assertNotIn("conduit", self.asked)
+
+    def test_mcp_remote_is_read_and_its_bearer_sent_only_to_its_address(self):
+        self.tokens(NOW + 3600)
+        self.probes[self.REMOTE] = (False, 401)
+        s = self.run_once()["servers"]["rem"]
+        self.assertEqual(s["state"], "lost")
+        self.assertEqual([u for u in self.bearer if u != self.REMOTE], [])
+
+    def test_mcp_remote_expired_with_auth_keeper_goes_to_the_developer_only(self):
+        self.tokens(NOW - 600)
+        cfg = read(os.environ["HUB_CONFIG"])
+        cfg["extensions"]["auth-keeper"] = {"path": "x"}
+        write(os.environ["HUB_CONFIG"], cfg)
+        for i in range(4):
+            s = self.run_once(NOW + i * 900)["servers"]["rem"]
+            self.assertEqual(self.notes(), [], i)
+        self.assertEqual((s["state"], s["by"]), ("lost", "auth-keeper"))
+
+    def test_ladder_developer_first_owner_after_two_more_passes(self):
+        self.gate()
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        self.run_once()
+        self.assertEqual(self.notes(), [])
+        self.assertIn("gate (claude)", self.dev()[0]["text"])
+        self.run_once(NOW + 900)
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+        self.run_once(NOW + 1800)
+        self.assertEqual(len(self.notes()), 1)
+        self.assertTrue(self.notes()[0]["urgent"])
+        self.assertEqual(self.dev(), [])
+        self.run_once(NOW + 2700)
+        self.assertEqual(self.notes(), [])
+
+    def test_revived_before_the_owner_hears_tells_nobody_else(self):
+        self.gate()
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        self.run_once()
+        self.probes.pop("https://gate.example/mcp")
+        self.assertEqual(self.run_once(NOW + 900)["servers"]["gate"]["state"], "ok")
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        for i in (2, 3):
+            self.run_once(NOW + i * 900)
+            self.assertEqual(self.notes(), [], i)
+
+    def test_a_pass_that_cannot_tell_does_not_reset_the_ladder(self):
+        self.gate()
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        self.run_once()
+        self.run_once(NOW + 900)
+        self.probes["https://gate.example/mcp"] = (None, None)
+        self.assertEqual(self.run_once(NOW + 1800)["servers"]["gate"]["state"], "later")
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        self.run_once(NOW + 2700)
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_ignore_and_hub_ignore_list(self):
+        self.on(True, ignore=["cli"])
+        cfg = read(os.environ["HUB_CONFIG"])
+        cfg["mcp_auth_ignore"] = ["gate"]
+        write(os.environ["HUB_CONFIG"], cfg)
+        s = self.run_once()["servers"]
+        self.assertNotIn("gate", s)
+        self.assertNotIn("cli", s)
+
+    def test_a_cli_program_is_no_duplicate_of_a_plugin_server(self):
+        plug = os.path.join(TMP, "plug")
+        write(os.path.join(plug, ".mcp.json"), {"mcpServers": {"canva": {"type": "http", "url": URLS["canva"]}}})
+        write(os.path.join(TMP, "claude", "settings.json"), {"enabledPlugins": {"canva@m": True}})
+        write(os.path.join(TMP, "claude", "plugins", "installed_plugins.json"),
+              {"plugins": {"canva@m": [{"installPath": plug}]}})
+        self.addCleanup(os.unlink, os.path.join(TMP, "claude", "settings.json"))
+        self.addCleanup(os.unlink, os.path.join(TMP, "claude", "plugins", "installed_plugins.json"))
+        self.assertEqual(main.duplicates(), [])
+
+
 class Strings(unittest.TestCase):
     def test_same_keys_in_every_language(self):
         for lang in main.STR:
