@@ -9,7 +9,12 @@ servers **the hub gives to its sessions** and says so once, before a session get
   plugins (`plugin:<plugin>:<server>`) that live sessions carry. Hub sessions run with `--strict-mcp-config`: they never
   read `~/.claude.json`, so the MCP of a plain Claude Code outside the hub is not checked.
 - **Remote servers only.** A server that runs as a program (stdio) is never started. `claude mcp list` is never run
-  (it starts every stdio server). A server with `headers`/`headersHelper` logs in by itself and is skipped.
+  (it starts every stdio server).
+- **Headers servers too.** A server with `headers` or `headersHelper` (an API key, no OAuth) is checked by its own
+  headers: the helper runs with a 30 s limit (exit 0 and a JSON object of strings), then the server gets an
+  `initialize` with those headers. 401/403 - "the server rejects the headers", a failing helper - "the helper gave no
+  key"; a hang or no network - "later". A leftover OAuth record of such a server is never used. The values stay in
+  memory and go only to the server's own address, by the same rules as a token.
 - **No second watchdog.** The core's MCP watch already tells sessions about "needs a login" and reconnects them. The
   plugin adds what it does not do: a stored login that a server now rejects, an erased record, a token that cannot be
   refreshed - and tells the owner once.
@@ -29,7 +34,10 @@ servers **the hub gives to its sessions** and says so once, before a session get
    prefer that the plugin never runs `claude`, set `ask_claude` to `false`: such a server is "later".
    `claude mcp get` knows `~/.claude.json` and plugins, not the hub catalog (hub sessions run with
    `--strict-mcp-config`): "No MCP server named ..." or an answer for another address says nothing about the login.
-   Such a server stays "later"; once its access has been expired for `stale_days` the view says so.
+   Then the word of the hub's live sessions counts (their Claude Code refreshed the login itself, under its lock, when
+   it connected): a live session that waits for a login - lost (after the second pass); one that is connected - live
+   (only when Claude Code had no word at all). Without such a session the server stays "later"; once its access has
+   been expired for `stale_days` the view says so.
 3. `claude mcp get` runs with a time limit (90 s). When it runs over, the whole process tree is killed (the process
    group on macOS/Linux, `taskkill /T` on Windows) - no orphans, no hung `claude`.
 
@@ -47,7 +55,9 @@ network without sleep (the idle loop looks at the clock every 30 s, at the netwo
 - One urgent message per pass lists the newly lost servers, the most important first (one-time logins, servers a working
   session uses right now), each with `hub mcp login <hub session> <server>`. Lifted when a check sees the server live.
 - Sessions that work with a lost server right now get one line (once per loss): do not loop on its tools.
-- A server never logged in is never an alarm.
+- A server never logged in is never an alarm. When sessions wait for its login, the view shows it as "never logged
+  in" and the Hub Developer gets one line a day with one `hub mcp login` per server (one login is enough for every
+  session).
 
 ## Duplicates (off by default)
 

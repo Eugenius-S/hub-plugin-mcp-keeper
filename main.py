@@ -3,8 +3,9 @@
 and says so before work stops on a lost one.
 
 What it watches: the servers of hub.json `mcp.<name>.server` plus the MCP servers (also plugins') that live hub sessions
-carry now (session info) - not ~/.claude.json of a plain Claude Code. Of them only the remote ones that have a stored
-OAuth login; a stdio server is never started, and `claude mcp list` is never run.
+carry now (session info) - not ~/.claude.json of a plain Claude Code. Of them the remote ones: an OAuth login, or
+`headers`/`headersHelper` (the helper runs with a limit, the server gets an initialize with those headers; values stay in
+memory). A stdio server is never started, and `claude mcp list` is never run.
 
 Every `every_minutes` (15) one pass, per server:
   1. the stored access (Claude Code credentials, read only, never written) goes in an `initialize` request to the
@@ -14,7 +15,8 @@ Every `every_minutes` (15) one pass, per server:
      time limit, the whole process tree is killed when it runs over, and the output is parsed in memory, never stored.
 The token goes only to https (http - only to localhost) and never through a redirect. The plugin never exchanges a
 refresh token itself, and keeps away from a refresh Claude Code is doing right now (its mcp-refresh-*.lock is fresh).
-Claude Code knows ~/.claude.json and plugins, not the hub catalog: "no such server" is not a verdict (the view shows it).
+Claude Code knows ~/.claude.json and plugins, not the hub catalog: "no such server" is not a verdict - then the word of
+the hub's live sessions counts (needs-auth - lost, after the second pass; connected - live).
 Lost is only an explicit refusal (401/403, "needs authentication", an erased record, a token that cannot be refreshed).
 A timeout, no network, 5xx - "later", nothing is said. A pass runs only after COOLDOWN seconds of a live network
 without sleep (the wall clock jumping away from the monotonic one); a new loss is told only if a second pass
@@ -23,8 +25,8 @@ CONFIRM_AFTER seconds later sees it too.
 To the owner: one urgent message per pass with the servers that are newly lost. One alarm per server per day, kept on
 disk: it is repeated only after the server was seen live and was lost again, and never within a day of the last one; the
 whole plugin says at most `max_alarms` a day. Sessions that work with a lost server get one line.
-Never a server never logged in (the core's MCP watch tells sessions about it) and never a duplicate unless
-`check_duplicates` is on.
+Never a server never logged in (state "first" when sessions wait for it: one line a day to the Hub Developer) and
+never a duplicate unless `check_duplicates` is on.
 
 Out: the fact ext.<name>.checked, owner.notify (urgent - a quiet Telegram summary would swallow it), a short message
 to the sessions that are working with this server right now, and the status in the plugin's channel (for its view).
@@ -63,7 +65,9 @@ TRIES = 3
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
 UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" to Python-urllib
-STATES = ("ok", "lost", "later")
+HELPER_TIMEOUT = 30       # a headersHelper run over this is killed: "later"
+STATES = ("ok", "lost", "later", "first")
+LIVE = ("idle", "busy", "dialog")   # sessions with a process: their MCP status is Claude Code's own fresh word
 
 STR = {
     "en": {
@@ -84,6 +88,15 @@ STR = {
         "to_session": "MCP {server}: the login is lost, the owner is told. Its tools fail until then - do not repeat "
                       "the calls in a loop; work without it or wait, the hub reconnects it after the login.",
         "status": "MCP: {ok} live, {bad} lost, {later} later",
+        "status_first": "MCP: {ok} live, {bad} lost, {later} later, {first} never logged in",
+        "why_first": "never logged in; sessions wait for it",
+        "first": "MCP never logged in: {names} - sessions get these servers but nobody has logged in yet (not a lost "
+                 "login). One login per server is enough, every session picks it up:",
+        "first_line": "\u2022 {name}: hub mcp login {hub} {name}",
+        "why_helper": "the headersHelper failed (exit {code})",
+        "why_helper_out": "the headersHelper printed no headers",
+        "why_headers": "the server rejects the headers (HTTP {code})",
+        "fix_headers": "renew the key of hub.json mcp.{name}.server",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает — хаб освежит его, когда сессия "
@@ -103,6 +116,15 @@ STR = {
         "to_session": "MCP {server}: слетел вход, владелец знает. До входа его инструменты не работают — не повторяй "
                       "вызовы по кругу; работай без него или подожди, после входа хаб переподключит сервер.",
         "status": "MCP: живы {ok}, слетели {bad}, позже {later}",
+        "status_first": "MCP: живы {ok}, слетели {bad}, позже {later}, не входили {first}",
+        "why_first": "ни разу не входили, сессии ждут входа",
+        "first": "MCP без входа: {names} — сессии получают эти серверы, но в них ещё ни разу не входили (это не слёт). "
+                 "Хватит одного входа на сервер, все сессии подхватят:",
+        "first_line": "\u2022 {name}: hub mcp login {hub} {name}",
+        "why_helper": "headersHelper не сработал (код {code})",
+        "why_helper_out": "headersHelper не выдал заголовков",
+        "why_headers": "сервер отвергает заголовки (HTTP {code})",
+        "fix_headers": "обнови ключ в hub.json mcp.{name}.server",
     },
 }
 
@@ -268,10 +290,10 @@ def kill_tree(proc):
         pass
 
 
-def run_limited(cmd, timeout):
+def run_limited(cmd, timeout, merge=True):
     """(code, text) of a command run with a time limit; the output stays in memory. Over the limit - (124, "") and the
-    whole process tree killed, no orphans. None - could not start."""
-    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL,
+    whole process tree killed, no orphans. None - could not start. merge=False - stderr is dropped, not read."""
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT if merge else subprocess.DEVNULL, "stdin": subprocess.DEVNULL,
           "cwd": os.path.expanduser("~")}
     if os.name != "nt":
         kw["start_new_session"] = True
@@ -459,13 +481,25 @@ def probe(ent):
     """Does the server take the access of the entry: True / False (401, 403) / None (cannot tell: no network, 5xx, a
     redirect, an unsafe address, no address or token). The token and the body go nowhere."""
     url, token = ent.get("serverUrl"), ent.get("accessToken")
-    if not url or not token or not safe_url(url):
+    if not url or not token:
+        return None, None
+    return probe_with(url, {"Authorization": "Bearer " + token})
+
+
+def probe_keyed(url, head):
+    """A headers server asked with its own headers (they stay in memory)."""
+    return probe_with(url, head)
+
+
+def probe_with(url, auth):
+    """probe() with the given login headers (a bearer token or what a headers server sends)."""
+    if not url or not auth or not safe_url(url):
         return None, None
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
                                   "clientInfo": {"name": "hub-mcp-keeper", "version": "1"}}}).encode()
-    head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": UA,
-            "Authorization": "Bearer " + token}
+    head = {**auth, "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+            "User-Agent": UA}
     # a proxy with an https:// scheme breaks urllib - the second try goes direct
     for opener in (urllib.request.build_opener(NoRedirect), urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))):
         try:
@@ -546,9 +580,80 @@ CALM = Calm()
 # ───── what the hub gives to sessions ─────
 
 def remote(server):
-    """A server that logs in by OAuth over the network: an address, no program, no headers (those log in by themselves)."""
+    """A server that logs in by OAuth over the network: an address, no program, no login headers (those log in by
+    themselves; a plain header such as a client tag does not make it one)."""
     return (isinstance(server, dict) and isinstance(server.get("url"), str) and bool(server["url"].strip())
-            and not server.get("command") and not (server.get("headers") or server.get("headersHelper")))
+            and not server.get("command") and not keyed(server))
+
+
+AUTH_HEADER = re.compile(r"auth|key|token|secret|bearer|cookie|session", re.I)
+
+
+def keyed(server):
+    """A server that logs in by headers: a `headersHelper` command or a login header (Authorization, an API key, a
+    token) among its static `headers`; an address, no program."""
+    head = server.get("headers") if isinstance(server, dict) else None
+    return (isinstance(server, dict) and isinstance(server.get("url"), str) and bool(server["url"].strip())
+            and not server.get("command")
+            and (bool(server.get("headersHelper")) or any(AUTH_HEADER.search(str(k)) for k in (head or {})
+                                                            if isinstance(head, dict))))
+
+
+def header_servers():
+    """{name: server} - headers servers the hub gives to its sessions (the hub catalog and plugins)."""
+    catalog = (config() or {}).get("mcp")
+    out = {}
+    for n, v in sorted((catalog if isinstance(catalog, dict) else {}).items()):
+        srv = v.get("server") if isinstance(v, dict) else None
+        if keyed(srv):
+            out[str(n)] = srv
+    for n, v in sorted(plugin_servers().items()):
+        if keyed(v):
+            out.setdefault(n, v)
+    return out
+
+
+def expand(value):
+    """${VAR} and ${VAR:-default} of the environment, as Claude Code expands them in an MCP config."""
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                  lambda m: os.environ.get(m.group(1)) or (m.group(2) or ""), str(value))
+
+
+def helper_headers(srv):
+    """(headers, why) of a headers server: its static headers plus what its headersHelper prints (a JSON object of
+    strings). (None, "later") - the helper ran over its time; (None, why) - it failed. Values stay in memory."""
+    head = {str(k): expand(v) for k, v in (srv.get("headers") or {}).items()} if isinstance(srv.get("headers"), dict) else {}
+    cmd = srv.get("headersHelper")
+    if isinstance(cmd, str) and cmd.strip():
+        shell = ["cmd", "/c", cmd] if os.name == "nt" else ["/bin/sh", "-c", cmd]
+        r = run_limited(shell, HELPER_TIMEOUT, merge=False)
+        if not isinstance(r, tuple) or r[0] == 124:
+            return None, "later"
+        if r[0] != 0:
+            return None, tr("why_helper", code=r[0])
+        try:
+            got = json.loads(r[1].strip() or "null")
+        except ValueError:
+            got = None
+        if not isinstance(got, dict) or not got or not all(isinstance(v, str) and v for v in got.values()):
+            return None, tr("why_helper_out")
+        head.update({str(k): v for k, v in got.items()})
+    return (head or None), (None if head else tr("why_helper_out"))
+
+
+def session_verdict(name, hub_st, live=True):
+    """What Claude Code in the hub's own sessions says about this server (their MCP status at start and at a turn):
+    auth | connected | None. live - only sessions with a process (a sleeping one keeps the word of its last start)."""
+    said = None
+    for s in (hub_st.get("sessions") or {}).values():
+        if s.get("state") == "removed" or (live and s.get("state") not in LIVE):
+            continue
+        info = s.get("info") or {}
+        if name in (info.get("mcp_auth") or []):
+            return "auth"
+        if name in (info.get("mcp") or []) and name not in (info.get("mcp_failed") or []):
+            said = "connected"
+    return said
 
 
 def served(hub_st):
@@ -650,8 +755,10 @@ def ask(name, ent, now, st, conf, url=None):
 
 
 def checkup(conf, now, st, hub, hub_st):
-    """{servers: {name: {state, why, fix}}, logged} for what the hub gives to sessions; states: ok | lost | later.
-    A live access is asked of the server itself (initialize); an expired one - of Claude Code, about this server only."""
+    """{servers: {name: {state, why, fix}}, logged} for what the hub gives to sessions; states: ok | lost | later | first.
+    A live access is asked of the server itself (initialize); an expired one - of Claude Code, about this server only,
+    and where it cannot tell (a hub catalog server) - of the hub's live sessions. A headers server - its helper runs
+    and the server is asked with those headers. first - never logged in while sessions wait for it (not a loss)."""
     ignore, had = conf["ignore"], set(st.get("had") or [])
     entries = oauth_entries(credentials())
     out, logged = {}, []
@@ -663,7 +770,9 @@ def checkup(conf, now, st, hub, hub_st):
         if not has:
             if name in had:   # it was live with a stored login and the record is gone: something erased it
                 out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": login_fix(name, hub)}
-            continue   # never logged in: a login nobody made is no loss
+            elif session_verdict(name, hub_st, live=False) == "auth":   # never logged in, and sessions wait for it
+                out[name] = {"state": "first", "why": tr("why_first"), "fix": login_fix(name, hub)}
+            continue   # never logged in and nobody waits: a login nobody made is no loss
         logged.append(name)
         lose = lambda why: {"state": "lost", "why": why, "fix": login_fix(name, hub)}
         expires = (ent.get("expiresAt") or 0) / 1000
@@ -678,6 +787,13 @@ def checkup(conf, now, st, hub, hub_st):
                 row = {"state": "ok"}
         elif ent.get("refreshToken"):
             said = ask(name, ent, now, st, conf, url)
+            if said in ("unknown", "later") and not (short(name) in conf["one_time"] and said == "later" and
+                                                     refresh_busy(now)):
+                # Claude Code outside the hub does not know a catalog server: the word of the hub's live sessions -
+                # their Claude Code refreshed this login itself, under its lock, when it connected
+                # ("connected" only where Claude Code cannot tell at all: a session's word of its start may be old)
+                word = session_verdict(name, hub_st)
+                said = word if word == "auth" or (word and said == "unknown") else said
             row = lose(tr("why_auth")) if said == "auth" else {"state": "ok"} if said == "connected" else row
             days = (now - expires) / DAY if expires else 0
             if said == "unknown" and conf["stale_days"] and days >= conf["stale_days"]:
@@ -687,6 +803,17 @@ def checkup(conf, now, st, hub, hub_st):
         if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
             row = lose(tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
         out[name] = row
+    for name, srv in sorted(header_servers().items()):
+        if ignored(name, ignore) or name in out:
+            continue
+        head, why = helper_headers(srv)
+        fix = tr("fix_headers", name=name)
+        if head is None:
+            out[name] = {"state": "later"} if why == "later" else {"state": "lost", "why": why, "fix": fix}
+            continue
+        ok, code = probe_keyed(srv["url"], head)
+        out[name] = ({"state": "lost", "why": tr("why_headers", code=code), "fix": fix} if ok is False
+                     else {"state": "ok"} if ok else {"state": "later"})
     return {"servers": out, "logged": logged, "later_all": False}
 
 
@@ -894,7 +1021,9 @@ def post_status(st, res, conf, now):
     st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}
     write_status(st)
     count = lambda *states: sum(r["state"] in states for r in rows.values())
-    head = tr("status", ok=count("ok"), bad=count("lost"), later=count("later", "failed"))
+    first = count("first")
+    head = tr("status_first" if first else "status", ok=count("ok"), bad=count("lost"), later=count("later", "failed"),
+              first=first)
     if head == st.get("posted"):
         return False
     put("ext.post", {"plugin": NAME, "text": head})
@@ -956,6 +1085,12 @@ def once(now=None):
     if remember(st, "told_dup", sorted(d["name"] for d in res["dups"]), now, set()) == "tell":
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"], "text": message({}, res["dups"], conf, use, ok_at)})
+    # never logged in is no loss (owner 22.10): one line a day to the Hub Developer, who asks the owner for one login
+    first = sorted(n for n, s in servers.items() if s["state"] == "first")
+    if remember(st, "told_never", first, now, set()) == "tell":
+        res["developer"] = developer(hub_st)
+        put("message.received", {"to": res["developer"], "text": "\n".join(
+            [tr("first", names=", ".join(first))] + [tr("first_line", name=n, hub=hub) for n in first])})
     save_state(st)
     return res
 

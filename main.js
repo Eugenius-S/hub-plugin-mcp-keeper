@@ -5,17 +5,17 @@ const STR = {
     title: "MCP logins", subtitle: "MCP servers of the hub, checked every {n} min",
     server: "Server", state: "State", ok_at: "Last live", checked: "Checked {when}",
     none: "No pass yet: the first one goes a minute after the start, after a calm network.",
-    ok: "live", lost: "login lost", later: "check later", never: "never",
+    ok: "live", lost: "login lost", later: "check later", first: "never logged in", never: "never",
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
     server: "Сервер", state: "Состояние", ok_at: "Последний раз жив", checked: "Проверено {when}",
     none: "Прохода ещё не было: первый — через минуту после старта, при спокойной сети.",
-    ok: "жив", lost: "слетел вход", later: "проверить позже", never: "никогда",
+    ok: "жив", lost: "слетел вход", later: "проверить позже", first: "ещё не входили", never: "никогда",
   },
 };
-const ORDER = { lost: 0, later: 1, ok: 2 };
-const COLOR = { lost: "#e5484d", later: "#8b8d98", ok: "#30a46c" };
+const ORDER = { lost: 0, first: 1, later: 2, ok: 3 };
+const COLOR = { lost: "#e5484d", first: "#f5a524", later: "#8b8d98", ok: "#30a46c" };
 
 let hub;
 let last = { id: 0, at: 0, data: null };

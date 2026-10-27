@@ -42,10 +42,12 @@ class Base(unittest.TestCase):
         self.asked = []    # names `claude mcp get` was asked about
         self.gets = {}     # name -> output of `claude mcp get <name>` (a list is consumed, the last repeats)
         self.probes = {}   # server url -> (ok, code)
+        self.keyed = []    # (url, header names) a headers server was asked with
         patches = [
             mock.patch.object(main, "put", lambda t, d, entity=None: self.facts.append((t, d))),
             mock.patch.object(main, "mcp_get", self.fake_get),
             mock.patch.object(main, "probe", lambda ent: self.probes.get(ent.get("serverUrl"), (True, 200))),
+            mock.patch.object(main, "probe_keyed", self.fake_keyed),
             mock.patch.object(main, "net_up", lambda: True),
             mock.patch.object(main, "processes", lambda name: [{"pid": 1, "started": "x", "kind": "claude"}]),
             mock.patch.object(main, "lang", lambda: "en"),
@@ -73,6 +75,10 @@ class Base(unittest.TestCase):
         if plugin is not None:
             cfg["extensions"] = {"mcp-keeper": plugin}
         write(os.environ["HUB_CONFIG"], cfg)
+
+    def fake_keyed(self, url, head):
+        self.keyed.append((url, sorted(head)))
+        return self.probes.get(url, (True, 200))
 
     def tick(self, seconds):
         self.clock += seconds
@@ -164,11 +170,17 @@ class Served(Base):
         self.assertEqual(self.asked, [])
 
     def test_header_server_is_not_judged_by_a_leftover_login(self):
-        self.config({"mcp": {"buffer": {"server": {"type": "http", "url": "https://b/mcp", "headers": {"X": "y"}}}}})
+        self.config({"mcp": {"buffer": {"server": {"type": "http", "url": "https://b/mcp", "headers": {"X-Api-Key": "y"}}}}})
         recs = read(os.environ["MCP_KEEPER_CREDS"])
         recs["mcpOAuth"]["buffer|x"] = {"serverName": "buffer", "serverUrl": "https://b/mcp", "accessToken": "old"}
         write(os.environ["MCP_KEEPER_CREDS"], recs)
-        self.assertNotIn("buffer", self.run_once()["servers"])
+        self.probes["https://b/mcp"] = (False, 401)    # the old token is dead ...
+        self.hub["sessions"]["worker"]["info"]["mcp"].append("buffer")
+        with mock.patch.object(main, "probe", side_effect=AssertionError("the leftover token was sent")):
+            res = self.run_once()
+        # ... and the server is judged by its own headers only
+        self.assertEqual(self.keyed, [("https://b/mcp", ["X-Api-Key"])] * len(self.keyed))
+        self.assertEqual(res["servers"]["buffer"]["state"], "lost")
 
 
 class Pass(Base):
@@ -566,6 +578,10 @@ class Token(Base):
 class Unknown(Base):
     """Catalog servers are not in ~/.claude.json: `claude mcp get` does not know them - that is not a verdict."""
 
+    def setUp(self):
+        super().setUp()
+        self.hub["sessions"]["worker"]["info"]["mcp"] = ["canva"]   # no session says a word about figma
+
     def expire(self, *names):
         recs = read(os.environ["MCP_KEEPER_CREDS"])
         for n in names:
@@ -755,6 +771,158 @@ class Limit(Base):
                 self.assertIsNone(REAL_GET("figma"))
         finally:
             os.environ["HUB_CLAUDE"] = os.path.join(TMP, "claude.sh")
+
+
+class SessionWord(Base):
+    """Where Claude Code outside the hub cannot tell (a hub catalog server), the hub's live sessions can: their Claude
+    Code refreshed the login itself, under its lock, when it connected."""
+
+    def expire(self, name):
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        recs["mcpOAuth"][name + "|abc"]["expiresAt"] = (NOW - 60) * 1000
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+        self.gets[name] = 'No MCP server named "%s"' % name
+
+    def test_live_session_connected_is_ok(self):
+        self.expire("figma")
+        self.assertEqual(self.run_once()["servers"]["figma"]["state"], "ok")
+
+    def test_live_session_needs_auth_is_lost_after_the_second_pass(self):
+        self.expire("figma")
+        self.hub["sessions"]["worker"]["info"]["mcp_auth"] = ["figma"]
+        res = self.run_once()
+        self.assertEqual(res["servers"]["figma"]["state"], "lost")
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_a_parked_session_is_no_word(self):
+        self.expire("canva")
+        self.hub["sessions"]["worker"]["info"]["mcp"] = []
+        self.assertEqual(self.run_once()["servers"]["canva"]["state"], "later")   # only sleepy (parked) has it
+
+    def test_connected_does_not_override_a_real_later(self):
+        self.expire("figma")
+        self.gets["figma"] = G_FAIL   # Claude Code itself could not reach it: the old word of a session is not "ok"
+        self.assertNotEqual(self.run_once()["servers"]["figma"]["state"], "ok")
+
+    def test_needs_auth_of_a_session_refreshes_nothing_itself(self):
+        self.expire("figma")
+        self.hub["sessions"]["worker"]["info"]["mcp_auth"] = ["figma"]
+        with mock.patch.object(main.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            self.run_once()
+
+
+class FirstLogin(Base):
+    """A server the hub gives, sessions wait for its login, nobody ever logged in: no loss, one line a day to the Hub
+    Developer with one login command per server."""
+
+    def setUp(self):
+        super().setUp()
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        del recs["mcpOAuth"]["mobbin|abc"]
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+        self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
+
+    def test_first_is_shown_and_told_to_the_developer_once_a_day(self):
+        res = self.run_once()
+        self.assertEqual(res["servers"]["mobbin"]["state"], "first")
+        self.assertEqual(self.notes(), [])
+        (msg,) = self.dev()
+        self.assertIn("mobbin", msg["text"])
+        self.assertIn("hub mcp login hub mobbin", msg["text"])
+        self.run_once(NOW + 3600)
+        self.assertEqual(self.dev(), [])
+        self.run_once(NOW + 86400 + 60)
+        self.assertEqual(len(self.dev()), 1)
+        self.assertEqual(read(os.environ["MCP_KEEPER_STATUS"])["servers"]["mobbin"]["state"], "first")
+
+    def test_nobody_waits_nothing_is_said(self):
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
+        res = self.run_once()
+        self.assertNotIn("mobbin", res["servers"])
+        self.assertEqual(self.dev(), [])
+
+    def test_status_line_counts_it(self):
+        self.run_once()
+        posts = [d["text"] for t, d in self.facts if t == "ext.post"]
+        self.assertTrue(posts and "never logged in" in posts[-1], posts)
+
+
+class Headers(Base):
+    """A headers server: its helper is run with a limit, the server is asked with those headers; a rejected key is one
+    alarm a day, a hang or no network is "later". Values go nowhere."""
+
+    def setUp(self):
+        super().setUp()
+        self.config({"mcp": {"buffer": {"server": {"type": "http", "url": "https://b/mcp", "headersHelper": "helper"}},
+                             "icons": {"server": {"type": "http", "url": "https://i/mcp",
+                                                  "headers": {"Authorization": "Bearer ${KEEPER_TEST_KEY}"}}}}})
+        self.hub["sessions"]["worker"]["info"]["mcp"] = ["buffer", "icons"]
+        self.helper = (0, '{"Authorization": "Bearer secret-value"}')
+        p = mock.patch.object(main, "run_limited", lambda cmd, timeout, merge=True: self.helper)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_live_headers_are_ok(self):
+        res = self.run_once()
+        self.assertEqual((res["servers"]["buffer"]["state"], res["servers"]["icons"]["state"]), ("ok", "ok"))
+        self.assertIn(("https://b/mcp", ["Authorization"]), self.keyed)
+
+    def test_rejected_key_is_lost_and_told_once(self):
+        self.probes["https://b/mcp"] = (False, 401)
+        res = self.run_once()
+        self.assertEqual(res["servers"]["buffer"]["state"], "lost")
+        self.assertIn("401", res["servers"]["buffer"]["why"])
+        self.assertIn("mcp.buffer.server", res["servers"]["buffer"]["fix"])
+        self.assertEqual(len(self.notes()), 1)
+        self.run_once(NOW + 3600)
+        self.assertEqual(self.notes(), [])
+
+    def test_helper_failure_is_lost(self):
+        for out in [(1, ""), (0, "not json"), (0, "{}"), (0, '{"A": 5}')]:
+            self.helper = out
+            self.assertEqual(self.run_once()["servers"]["buffer"]["state"], "lost", out)
+
+    def test_helper_timeout_or_no_start_is_later(self):
+        for out in [(124, ""), None]:
+            self.helper = out
+            self.assertEqual(self.run_once()["servers"]["buffer"]["state"], "later", out)
+
+    def test_server_down_is_later(self):
+        self.probes["https://i/mcp"] = (None, None)
+        self.assertEqual(self.run_once()["servers"]["icons"]["state"], "later")
+
+    def test_header_values_are_never_stored(self):
+        os.environ["KEEPER_TEST_KEY"] = "env-secret"
+        self.addCleanup(os.environ.pop, "KEEPER_TEST_KEY", None)
+        self.probes["https://b/mcp"] = (False, 403)
+        self.run_once()
+        state = read(os.path.join(main.HOME, "state.json"), raw=True)
+        dump = json.dumps(self.facts) + read(os.environ["MCP_KEEPER_STATUS"], raw=True) + state
+        for secret in ("secret-value", "env-secret"):
+            self.assertNotIn(secret, dump)
+
+    def test_env_is_expanded_in_static_headers(self):
+        os.environ["KEEPER_TEST_KEY"] = "k"
+        self.addCleanup(os.environ.pop, "KEEPER_TEST_KEY", None)
+        head, why = main.helper_headers({"url": "https://i/mcp", "headers": {"Authorization": "Bearer ${KEEPER_TEST_KEY}"}})
+        self.assertEqual((head, why), ({"Authorization": "Bearer k"}, None))
+
+    def test_a_plain_header_keeps_an_oauth_server_oauth(self):
+        # a client tag header is no login: the server is an OAuth one, its stored login is checked as before
+        srv = {"type": "http", "url": URLS["figma"], "headers": {"X-Plugin-Bundle": "b"}}
+        self.assertEqual((main.keyed(srv), main.remote(srv)), (False, True))
+        self.config({"mcp": {"figma": {"server": srv}}})
+        self.creds(figma={"serverUrl": URLS["figma"], "accessToken": "t", "refreshToken": "r",
+                          "expiresAt": (NOW + 3600) * 1000})
+        self.hub["sessions"]["worker"]["info"]["mcp"] = ["figma"]
+        res = self.run_once()
+        self.assertEqual(res["servers"]["figma"]["state"], "ok")
+        self.assertEqual(self.keyed, [])
+
+    def test_real_probe_sends_the_headers_only_to_a_safe_address(self):
+        with mock.patch.object(main.urllib.request, "urlopen", side_effect=AssertionError("sent")):
+            self.assertEqual(main.probe_with("http://evil.example.com/mcp", {"Authorization": "x"}), (None, None))
 
 
 class Strings(unittest.TestCase):
