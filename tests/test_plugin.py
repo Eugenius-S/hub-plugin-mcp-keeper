@@ -1732,6 +1732,13 @@ class CatalogRules(unittest.TestCase):
         self.assertLessEqual((int(major), int(minor)), (1, 30))
 
 
+    def test_the_description_fits_the_catalog_limit(self):
+        with open(os.path.join(ROOT, "hub-plugin.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        self.assertLessEqual(len(man["description"]), 300)
+        self.assertLessEqual(len(man["i18n"]["ru"]["description"]), 300)
+
+
 class Strings(unittest.TestCase):
     def test_same_keys_in_every_language(self):
         for lang in main.STR:
