@@ -497,6 +497,8 @@ class Secrets(Base):
                                  "servers": {"a": {"state": "ok", "ok_at": 2, "args": ["--token", "x"], "url": "https://u?k=1"},
                                              "b": {"state": "weird"}, "c": "text"}})
         self.assertEqual(got["servers"], {"a": {"state": "ok", "ok_at": 2}})
+        got = main.clean_status({"servers": {"a": {"state": "lost", "can_login": True}, "b": {"state": "lost", "can_login": "yes"}}})
+        self.assertEqual(got["servers"], {"a": {"state": "lost", "can_login": True}, "b": {"state": "lost"}})
 
 
 class Token(Base):
@@ -1095,6 +1097,163 @@ class Cover(Base):
         self.addCleanup(os.unlink, os.path.join(TMP, "claude", "settings.json"))
         self.addCleanup(os.unlink, os.path.join(TMP, "claude", "plugins", "installed_plugins.json"))
         self.assertEqual(main.duplicates(), [])
+
+
+class ViewLogin(Base):
+    """The view's "Log in" button: the owner's post "login <server>" in the plugin channel -> `hub mcp login` run by the
+    process (a fake here, nothing is opened); the row says what the login is doing."""
+
+    def setUp(self):
+        super().setUp()
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        del recs["mcpOAuth"]["mobbin|abc"]
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+        self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
+        self.reject("canva")
+        res = self.run_once()
+        self.assertEqual((res["servers"]["mobbin"]["state"], res["servers"]["canva"]["state"]), ("first", "lost"))
+        self.ran = []
+        self.code, self.out = 0, "login waits for the browser\n"
+        self.result = None   # what the hub's waiting process wrote: (code, last line) or None - still waiting
+        self.hub["feeds"] = {main.NAME: []}
+        for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
+                  mock.patch.object(main, "login_result", lambda server: self.result),
+                  mock.patch.object(main, "run_limited", self.fake_run)):
+            p.start()
+            self.addCleanup(p.stop)
+        main.RECHECK_NOW.clear()
+
+    def fake_run(self, cmd, timeout, merge=True):
+        self.ran.append(cmd[2:])
+        return self.code, self.out
+
+    def click(self, seq, server, by="owner", ts=NOW, text=None):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text or f"login {server}", "ts": ts})
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def test_only_a_server_that_needs_login_has_the_button(self):
+        rows = self.rows()
+        self.assertTrue(rows["mobbin"]["can_login"] and rows["canva"]["can_login"])
+        self.assertNotIn("can_login", rows["figma"])
+
+    def test_click_runs_the_hub_command_with_a_live_session_that_has_the_server(self):
+        self.click(1, "mobbin")
+        self.assertTrue(main.login_step(NOW + 1))
+        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
+        self.assertEqual(self.rows()["mobbin"]["login"], {"state": "wait", "at": NOW + 1})
+
+    def test_no_live_session_with_the_server_takes_a_sleeping_one_then_the_hub(self):
+        self.hub["sessions"]["worker"]["info"]["mcp"].remove("mobbin")
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [["mcp", "login", "sleepy", "mobbin"]], "a sleeping session is still a session of the server")
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
+        self.result = (1, "gone")
+        main.login_step(NOW + 2)
+        self.click(2, "mobbin")
+        main.login_step(NOW + 3)
+        self.assertEqual(self.ran[-1], ["mcp", "login", "hub", "mobbin"])
+
+    def test_the_post_is_taken_once_and_only_from_the_owner_while_fresh(self):
+        self.click(1, "mobbin", by="worker")
+        self.click(2, "mobbin", ts=NOW - main.LOGIN_FRESH - 5)
+        self.click(3, "mobbin", text="login mobbin --evil; x")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        self.click(4, "mobbin")
+        main.login_step(NOW + 2)
+        self.result = (1, "no")
+        main.login_step(NOW + 3)
+        main.login_step(NOW + 4)
+        self.assertEqual(len(self.ran), 1, "the same post does not start a second login")
+
+    def test_open_login_is_not_started_twice(self):
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.click(2, "mobbin")
+        main.login_step(NOW + 2)
+        self.assertEqual(len(self.ran), 1)
+
+    def test_server_without_the_button_is_refused_not_run(self):
+        self.click(1, "figma")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        row = self.rows()["figma"]["login"]
+        self.assertEqual(row["state"], "fail")
+        self.assertIn("no login", row["why"])
+
+    def test_command_failure_is_shown_with_the_reason(self):
+        self.code, self.out = 1, "no such session\nhttps://secret.example/auth?code=1\nsession x does not exist\n"
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        got = self.rows()["mobbin"]["login"]
+        self.assertEqual(got["state"], "fail")
+        self.assertEqual(got["why"], "session x does not exist")
+        self.assertNotIn("secret", json.dumps(self.rows()))
+
+    def test_no_hub_command_is_a_fail_not_a_crash(self):
+        with mock.patch.object(main, "hub_bin", lambda: None):
+            self.click(1, "mobbin")
+            main.login_step(NOW + 1)
+        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "fail")
+        self.assertEqual(self.ran, [])
+
+    def test_waiting_ends_with_the_result_of_the_hub_process(self):
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.assertFalse(main.login_step(NOW + 10), "still waiting: nothing changes")
+        self.assertFalse(main.RECHECK_NOW.is_set())
+        self.result = (0, "logged in")
+        self.assertTrue(main.login_step(NOW + 20))
+        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "done")
+        self.assertTrue(main.RECHECK_NOW.is_set(), "the next pass checks at once, not in 15 minutes")
+
+    def test_waiting_ends_with_a_failure_and_with_a_timeout(self):
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.result = (1, "the browser was closed")
+        main.login_step(NOW + 20)
+        self.assertEqual(self.rows()["mobbin"]["login"], {"state": "fail", "at": NOW + 20, "why": "the browser was closed"})
+        self.result = None
+        self.click(2, "canva")
+        main.login_step(NOW + 30)
+        main.login_step(NOW + 30 + main.LOGIN_LIVE + 1)
+        got = self.rows()["canva"]["login"]
+        self.assertEqual(got["state"], "fail")
+        self.assertIn("no login within", got["why"])
+
+    def test_login_done_at_once_is_done(self):
+        self.result = (0, "")
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "done")
+        self.assertTrue(main.RECHECK_NOW.is_set())
+
+    def test_an_old_result_goes_from_the_view(self):
+        self.click(1, "mobbin")
+        main.login_step(NOW + 1)
+        self.result = (0, "")
+        main.login_step(NOW + 2)
+        self.assertIn("login", self.rows()["mobbin"])
+        with mock.patch.object(main.time, "time", lambda: NOW + 2 + main.LOGIN_SHOW + 1):
+            main.write_status(main.load_state())
+        self.assertNotIn("login", self.rows()["mobbin"])
+
+
+class Icon(unittest.TestCase):
+    """The menu draws a view icon with a mask: one colour, no background; icon.png is the cover of the market."""
+
+    def test_menu_icon_is_a_one_colour_svg(self):
+        with open(os.path.join(ROOT, "icon.svg"), encoding="utf-8") as f:
+            svg = f.read()
+        self.assertIn('fill="currentColor"', svg)
+        self.assertNotRegex(svg, r'fill="#|stroke="#|<rect|<image|style=')
+        with open(os.path.join(ROOT, "main.js"), encoding="utf-8") as f:
+            self.assertIn('icon: "icon.svg"', f.read())
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "icon.png")))
 
 
 class Strings(unittest.TestCase):

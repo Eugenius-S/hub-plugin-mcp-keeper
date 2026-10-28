@@ -125,6 +125,12 @@ output, command lines, free-form status rows) are removed or rewritten at start.
 
 The view "MCP logins" shows every server, its state and when it was last live (`status.json` next to the plugin).
 
+A row of a server that needs a login (never logged in, login lost) has a **Log in** / **Reconnect** button. It posts
+`login <server>` to the plugin channel; the process runs the same `hub mcp login <session> <server>` you would type in a
+terminal (a live session that has the server, else the hub's own) and your browser opens the login. The row says "login
+opened in the browser" until the hub reports the end, then the result (done, or why not); a login that went through
+makes the next check start at once. Only your own post counts, only for a server whose row has the button.
+
 Run one pass by hand: `PYTHONPATH=<hub code> python3 main.py --once`.
 
 Tests: `PYTHONPATH=<hub code> python3 -m unittest discover -s tests` - no real `claude`, network or keychain.

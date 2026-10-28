@@ -31,6 +31,8 @@ never a duplicate unless `check_duplicates` is on.
 Out: the fact ext.<name>.checked, owner.notify (urgent - a quiet Telegram summary would swallow it), a short message
 to the sessions that are working with this server right now, and the status in the plugin's channel (for its view).
 The state files hold server names, states and times only - no command lines, arguments, headers or addresses.
+The view's "Log in" button: its post "login <server>" (the owner's, in the plugin channel) runs `hub mcp login <session> <server>`;
+the row shows the login until the hub's waiting process writes its end, a login that went through starts the next pass at once.
 
 cover (off by default; true or a list of machine names): every MCP server of this machine - the hub catalog,
 ~/.claude.json, enabled plugins - each with its holder (by): claude, headers, conduit (read only: the hub's conduit
@@ -44,7 +46,7 @@ Settings - hub.json extensions[<plugin>]: every_minutes (15), warn_days (3), ign
 max_alarms (6 a day), ask_claude (true), net_check_minutes (5), stale_days (2), check_duplicates (false), cover (false), owner_after_passes (2), read_only ([names]), quiet_until (epoch or "YYYY-MM-DDTHH:MM" in the hub
 timezone); hub.json mcp_auth_ignore is honoured too.
 """
-import datetime, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import datetime, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
 KEY = os.environ.get("HUB_EXTENSION") or "mcp-keeper"   # hub.json extensions key: <account>:mcp-keeper from the market
 NAME = KEY.split(":")[-1]                                # channel and fact name
@@ -69,6 +71,11 @@ NET_EVERY = 5             # minutes between TCP checks of the network in the idl
 STALE_DAYS = 2            # an access expired this long that Claude Code cannot be asked about - shown in the view
 LOCK_FRESH = 300          # a refresh lock of Claude Code younger than this: someone is refreshing right now
 MAX_WAIT = 1800
+LOGIN_POLL = 5            # seconds between looks at the plugin channel for a click on "Log in"
+LOGIN_FRESH = 600         # a click older than this is not run (the process was down)
+LOGIN_LIVE = 360          # a login that waits longer has ended (the hub waits 300 s for the owner)
+LOGIN_RUN = 75            # the `hub mcp login` command itself (it returns once the link is open) - limit, seconds
+LOGIN_SHOW = 3600         # a finished login stays in the row this long
 TRIES = 3
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
@@ -119,6 +126,10 @@ STR = {
         "why_remote_later": "the mcp-remote access has expired: mcp-remote refreshes it at its start",
         "dev": "MCP: first sign of a lost login (the owner hears only if it stays lost for {passes} more passes):",
         "dev_line": "\u2022 {name} ({by}) - {why}: {fix}",
+        "login_unknown": "no login from this view for this server",
+        "login_nohub": "the hub command was not found",
+        "login_failed": "the login did not go through (code {code})",
+        "login_timeout": "no login within {minutes} min",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает — хаб освежит его, когда сессия "
@@ -158,6 +169,10 @@ STR = {
         "why_remote_later": "доступ mcp-remote истёк: mcp-remote освежит его при запуске",
         "dev": "MCP: первый признак слёта входа (владелец узнает, только если не оживёт ещё {passes} прохода):",
         "dev_line": "\u2022 {name} ({by}) — {why}: {fix}",
+        "login_unknown": "для этого сервера вход отсюда не запускается",
+        "login_nohub": "команда hub не найдена",
+        "login_failed": "вход не прошёл (код {code})",
+        "login_timeout": "не вошли за {minutes} мин",
     },
 }
 
@@ -1170,14 +1185,23 @@ def clean_status(data):
         if isinstance(r, dict) and r.get("state") in STATES:
             why = r.get("why") if isinstance(r.get("why"), str) and len(r["why"]) <= 160 and "://" not in r["why"] else None
             rows[str(n)] = {"state": r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
-                            **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {})}
+                            **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {}),
+                            **({"can_login": True} if r.get("can_login") is True else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY, "servers": rows}
 
 
 def write_status(st):
-    """The view's data - from the plugin state (a market update replaces the folder: rewritten at start too)."""
-    if st.get("status"):
-        write_json(status_path(), st["status"])
+    """The view's data - from the plugin state (a market update replaces the folder: rewritten at start too), with the
+    state of the logins the owner started from the view on top."""
+    if not st.get("status"):
+        return
+    out = {**st["status"], "servers": {n: dict(r) for n, r in st["status"]["servers"].items()}}
+    now = time.time()
+    for n, r in ((read_json(login_path()) or {}).get("rows") or {}).items():
+        if n in out["servers"] and isinstance(r, dict) and now - (r.get("at") or 0) < LOGIN_SHOW:
+            why = r.get("why") if isinstance(r.get("why"), str) and "://" not in r["why"] else None
+            out["servers"][n]["login"] = {"state": r.get("state"), "at": r.get("at"), **({"why": why[:160]} if why else {})}
+    write_json(status_path(), out)
 
 
 def start_clean():
@@ -1213,7 +1237,9 @@ def post_status(st, res, conf, now):
     """Rows for the view (status.json) every pass; one human line to the plugin channel when the picture changed."""
     ok_at = st.setdefault("ok_at", {})
     rows = {n: {"state": s["state"], "ok_at": ok_at.get(n), **({"why": s["why"]} if s.get("why") else {}),
-                **({"by": s["by"]} if s.get("by") else {})}
+                **({"by": s["by"]} if s.get("by") else {}),
+                **({"can_login": True} if s["state"] in ("lost", "first") and
+                   str(s.get("fix") or "").startswith("hub mcp login ") else {})}
             for n, s in sorted(res["servers"].items())}
     st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}
     write_status(st)
@@ -1226,6 +1252,151 @@ def post_status(st, res, conf, now):
     put("ext.post", {"plugin": NAME, "text": head})
     st["posted"], st["posted_at"] = head, now
     return True
+
+
+# ───── a login started from the view ─────
+# The view's button posts "login <server>" to the plugin channel (hub.postFeed: the owner's word). This process runs the
+# same `hub mcp login <session> <server>` the owner would type in a terminal; the hub waits for the owner's browser in
+# its own process and says mcp.logged_in itself, the sessions with the server reconnect.
+
+RECHECK_NOW = threading.Event()   # a login went through: the next pass does not wait for its time
+
+
+def login_path():
+    return os.path.join(HOME, "login.json")
+
+
+def hub_bin():
+    """bin/hub of the hub this process belongs to (next to the core package it imports); None if it is not there."""
+    try:
+        import core
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(core.__file__))), "bin", "hub")
+        return path if os.path.isfile(path) else None
+    except Exception:   # noqa: BLE001 - no core on the path
+        return None
+
+
+def login_session(hub_st, server):
+    """The session to log in through: one that has the server (a live one first), else the hub's own."""
+    best = None
+    for name, s in sorted((hub_st.get("sessions") or {}).items()):
+        if s.get("state") == "removed":
+            continue
+        info = s.get("info") or {}
+        if server in (info.get("mcp") or []) or server in (info.get("mcp_auth") or []):
+            rank = 0 if s.get("state") in LIVE else 1
+            if best is None or rank < best[0]:
+                best = (rank, name)
+    return best[1] if best else hub_session(hub_st)
+
+
+def login_result(server):
+    """(code, last line) when the hub's waiting login process has finished, else None."""
+    try:
+        from core import mcplogin
+        r = read_json(os.path.join(mcplogin.browser_dir(STATE, server), "result"))
+    except Exception:   # noqa: BLE001 - no core on the path
+        return None
+    if not isinstance(r, dict):
+        return None
+    lines = [x.strip() for x in str(r.get("out") or "").splitlines() if x.strip() and "://" not in x]
+    return r.get("code", 1), (lines[-1][:160] if lines else "")
+
+
+def login_failed(code, last, wait=0):
+    if code == 124:
+        return tr("login_timeout", minutes=max(1, round(wait / 60)) if wait else 5)
+    return last or tr("login_failed", code=code)
+
+
+def login_start(server, hub_st, now, run=None):
+    """One click: the login command, then the row's state - wait (the owner's browser is open) | fail."""
+    run = run or run_limited
+    hub = hub_bin()
+    if not hub:
+        return {"state": "fail", "at": now, "why": tr("login_nohub")}
+    cmd = [sys.executable, hub, "mcp", "login", login_session(hub_st, server), server]
+    got = run(cmd, LOGIN_RUN)
+    if got is None:
+        return {"state": "fail", "at": now, "why": tr("login_nohub")}
+    code, out = got
+    if code != 0:
+        lines = [x.strip() for x in str(out).splitlines() if x.strip() and "://" not in x]
+        return {"state": "fail", "at": now, "why": login_failed(code, lines[-1][:160] if lines else "", LOGIN_RUN)}
+    done = login_result(server)   # the command printed "done" at once: nothing to wait for
+    if done is not None:
+        return ({"state": "done", "at": now} if done[0] == 0 else
+                {"state": "fail", "at": now, "why": login_failed(done[0], done[1])})
+    return {"state": "wait", "at": now}
+
+
+def clicks(hub_st, after, now):
+    """[(seq, server)] - the owner's "login <server>" posts of the plugin channel after seq `after`, not older than
+    LOGIN_FRESH; the second item is the highest seq seen. Only the owner's word counts (a session posts there too)."""
+    out, top = [], after
+    for p in hub_st.get("feeds", {}).get(NAME) or []:
+        try:
+            seq = int(str(p["id"])[1:])
+        except (KeyError, ValueError):
+            continue
+        if seq <= after:
+            continue
+        top = max(top, seq)
+        m = re.fullmatch(r"login (\S{1,128})", str(p.get("text") or "").strip())
+        if p.get("by") == "owner" and m and now - float(p.get("ts") or 0) <= LOGIN_FRESH:
+            out.append((seq, m.group(1)))
+    return out, top
+
+
+def login_step(now=None, run=None, hub_st=None):
+    """One look: finish what waits, run what the owner clicked. True - the picture of the view changed."""
+    now = now or time.time()
+    data = read_json(login_path()) or {}
+    rows = data.setdefault("rows", {})
+    changed = False
+    for server, r in list(rows.items()):   # a waiting login ended: the hub's process wrote its result
+        if not isinstance(r, dict) or r.get("state") != "wait":
+            continue
+        done = login_result(server)
+        if done is not None:
+            rows[server] = ({"state": "done", "at": now} if done[0] == 0 else
+                            {"state": "fail", "at": now, "why": login_failed(done[0], done[1], LOGIN_LIVE)})
+        elif now - (r.get("at") or 0) > LOGIN_LIVE:
+            rows[server] = {"state": "fail", "at": now, "why": tr("login_timeout", minutes=LOGIN_LIVE // 60)}
+        else:
+            continue
+        changed = True
+        if rows[server]["state"] == "done":
+            RECHECK_NOW.set()
+    hub_st = hub_st if hub_st is not None else hub_state()
+    found, top = clicks(hub_st, int(data.get("seen") or 0), now)
+    if top != data.get("seen"):
+        data["seen"] = top
+        changed = True
+    can = {n for n, r in ((load_state().get("status") or {}).get("servers") or {}).items() if r.get("can_login")}
+    for _, server in found:
+        if (rows.get(server) or {}).get("state") == "wait":
+            continue   # one is open already: the click does not start a second
+        if server not in can:
+            rows[server] = {"state": "fail", "at": now, "why": tr("login_unknown")}
+        else:
+            rows[server] = login_start(server, hub_st, now, run)
+            if rows[server]["state"] == "done":
+                RECHECK_NOW.set()
+        changed = True
+    if changed:
+        write_json(login_path(), data)
+        write_status(load_state())
+    return changed
+
+
+def login_watch():
+    while True:
+        try:
+            login_step()
+        except Exception as e:   # noqa: BLE001 - the view's button must not take the checking down
+            print(time.strftime("%H:%M:%S"), "mcp-keeper: login:", type(e).__name__, flush=True)
+        time.sleep(LOGIN_POLL)
 
 
 def once(now=None):
@@ -1361,18 +1532,20 @@ def report(res):
 def loop():
     start_clean()
     write_status(load_state())   # the view has its data right after a market update replaced the folder
+    threading.Thread(target=login_watch, daemon=True).start()   # the view's "Log in" button
     if time.time() - float(load_state().get("at") or 0) >= AGAIN_AFTER:
         time.sleep(START_DELAY)
         report(once())
     while True:
         conf = settings()
         wake, net_at = time.time() + conf["every"], mono()
-        while time.time() < wake:   # sleep of the machine: go by the clock, not by a counter
+        while time.time() < wake and not RECHECK_NOW.is_set():   # sleep of the machine: go by the clock, not by a counter
             time.sleep(min(NET_STEP, max(1, wake - time.time())))
             due = mono() - net_at >= conf["net_every"]   # TCP to the outside - not every step
             CALM.look(net=due)
             if due:
                 net_at = mono()
+        RECHECK_NOW.clear()
         report(once())
 
 
