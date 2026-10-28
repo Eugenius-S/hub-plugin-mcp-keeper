@@ -3,9 +3,9 @@ const NAME = "mcp-keeper";
 const STR = {
   en: {
     title: "MCP logins", subtitle: "MCP servers of the hub, checked every {n} min",
-    server: "Server", state: "State", ok_at: "Last active", checked: "Checked {when}",
+    server: "Server", state: "State", ok_at: "Last connected", checked: "Checked {when}",
     none: "No pass yet: the first one goes a minute after the start, after a calm network.",
-    ok: "active", lost: "lost", first: "never logged in", never: "never",
+    ok: "connected", lost: "lost", first: "never logged in", never: "never",
     skip: "not checked", by: "Held by",
     login: "Log in", relogin: "Log in again", login_wait: "login… opened in the browser",
     login_done: "logged in, checking", login_fail: "login did not go through", login_sent: "asking the hub…",
@@ -18,9 +18,9 @@ const STR = {
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
-    server: "Сервер", state: "Состояние", ok_at: "Последний раз активен", checked: "Проверено {when}",
+    server: "Сервер", state: "Состояние", ok_at: "Последний раз подключен", checked: "Проверено {when}",
     none: "Прохода ещё не было: первый — через минуту после старта, при спокойной сети.",
-    ok: "активен", lost: "отвалился", first: "ещё не входили", never: "никогда",
+    ok: "подключен", lost: "отвалился", first: "ещё не входили", never: "никогда",
     skip: "не проверяется", by: "Кто держит",
     login: "Войти", relogin: "Войти заново", login_wait: "вход… открыт в браузере",
     login_done: "вошли, проверяю", login_fail: "вход не прошёл", login_sent: "прошу хаб…",
@@ -85,7 +85,7 @@ function button(cls, label, text, name, act, td) {
   return btn;
 }
 
-// The actions of a row: "Connect another account" for an active server with a login of its own (the process opens a
+// The actions of a row: "Connect another account" for a connected server with a login of its own (the process opens a
 // terminal where the login is changed), "Reconnect" (the server reconnects in every running session, no login) for a lost
 // one, "Log in" / "Log in again" (the process runs `hub mcp login`) where a login can help; or what is going on now.
 function actionCell(row, name, s) {

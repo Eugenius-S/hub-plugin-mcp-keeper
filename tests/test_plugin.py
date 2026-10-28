@@ -198,7 +198,7 @@ class Pass(Base):
         self.assertEqual({s["state"] for s in res["servers"].values()}, {"ok"})
         self.assertEqual(self.notes(), [])
         posts = [d for t, d in self.facts if t == "ext.post"]
-        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 active, 0 lost"}])   # a human line only
+        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 connected, 0 lost"}])   # a human line only
         with open(os.environ["MCP_KEEPER_STATUS"], encoding="utf-8") as f:
             self.assertEqual(json.load(f)["servers"]["canva"]["state"], "ok")   # the view's data - the file
         self.run_once(NOW + 900)
@@ -313,7 +313,7 @@ class Pass(Base):
         self.creds(canva={"serverUrl": URLS["canva"], "accessToken": "t", "refreshToken": "r",
                           "expiresAt": (NOW + 3600) * 1000})
         res = self.run_once()
-        self.assertEqual(res["servers"]["figma"], {"state": "ok"})   # a session holds it connected: active, no alarm
+        self.assertEqual(res["servers"]["figma"], {"state": "ok"})   # a session holds it connected, no alarm
         self.assertEqual((self.notes(), self.dev()), ([], []))
 
     def test_ignore_lists(self):
@@ -867,7 +867,7 @@ class FirstLogin(Base):
     def test_nobody_waits_nothing_is_said(self):
         self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
         res = self.run_once()
-        self.assertEqual(res["servers"]["mobbin"], {"state": "ok"})   # active by a session's word, nothing to fix
+        self.assertEqual(res["servers"]["mobbin"], {"state": "ok"})   # connected by a session's word, nothing to fix
         self.assertEqual(self.dev(), [])
 
     def test_status_line_counts_it(self):
@@ -1452,7 +1452,7 @@ class ViewReconnect(Base):
 
 
 class ViewSwitch(Base):
-    """0.7.0: an active server has "Connect another account" instead of "Reconnect". The plugin cannot do it itself (the
+    """0.7.0: a connected server has "Connect another account" instead of "Reconnect". The plugin cannot do it itself (the
     login of Claude Code is not ours to write): the owner's click "switch <server>" opens a terminal with claude (a fake
     opener here - no window is opened)."""
 
@@ -1484,7 +1484,7 @@ class ViewSwitch(Base):
         self.assertIn("Figma", hint)
         self.assertIn("Authenticate", hint)
         self.assertEqual(self.rows()["figma"]["login"], {"state": "done", "at": NOW + 1, "act": "switch"})
-        self.assertNotIn("mcp.reconnect", [t for t, _ in self.facts], "the active server is not touched")
+        self.assertNotIn("mcp.reconnect", [t for t, _ in self.facts], "the connected server is not touched")
 
     def test_a_server_that_cannot_switch_is_refused(self):
         self.post(1, "switch canva")
@@ -1589,7 +1589,7 @@ class AllServers(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.7.1")
+        self.assertEqual(m["version"], "0.7.2")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -1623,7 +1623,7 @@ console.log(JSON.stringify(out));
 
 
 class ViewButtons(unittest.TestCase):
-    """0.7.1: an active server has only "Connect another account"; "Log in" stays for a lost one and a never-logged-in one.
+    """0.7.1: a connected server has only "Connect another account"; "Log in" stays for a lost one and a never-logged-in one.
     The page is run in node with a stub hub (no browser)."""
 
     def buttons(self, rows):
@@ -1669,6 +1669,26 @@ class JsStrings(unittest.TestCase):
         self.assertTrue({"reconnect", "auto", "relogin", "switch", "ignored"} <= keys(src[en:ru]))
         self.assertNotIn("later", keys(src[en:ru]))
         self.assertFalse(re.search("[а-яА-ЯёЁ]", src[:ru] + src[end:]))
+
+
+class ConnectedWord(unittest.TestCase):
+    """0.7.2 (owner): the state of a working login is "connected" (ru: "подключен"), not "active"."""
+
+    def test_no_active_word_in_what_the_owner_reads(self):
+        import re
+        for name in ("main.js", "main.py", "hub-plugin.json", "README.md"):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+                src = f.read()
+            self.assertFalse(re.search(r"активен|активны|активн|Last active|last active|active", src, re.I), name)
+
+    def test_the_state_and_the_column_say_connected(self):
+        with open(os.path.join(ROOT, "main.js"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('ok: "connected"', src)
+        self.assertIn('ok_at: "Last connected"', src)
+        self.assertIn('ok: "подключен"', src)
+        self.assertIn("Последний раз подключен", src)
+        self.assertIn("подключены {ok}", main.STR["ru"]["status"])
 
 
 class Strings(unittest.TestCase):

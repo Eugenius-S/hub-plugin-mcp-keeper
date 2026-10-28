@@ -112,8 +112,8 @@ STR = {
         "why_expired": "the token without refresh has expired",
         "to_session": "MCP {server}: the login is lost, the owner is told. Its tools fail until then - do not repeat "
                       "the calls in a loop; work without it or wait, the hub reconnects it after the login.",
-        "status": "MCP: {ok} active, {bad} lost",
-        "status_first": "MCP: {ok} active, {bad} lost, {first} never logged in",
+        "status": "MCP: {ok} connected, {bad} lost",
+        "status_first": "MCP: {ok} connected, {bad} lost, {first} never logged in",
         "why_no_word": "no word from the running sessions yet",
         "why_no_word_program": "a program, not started here: no word from the running sessions yet",
         "switch_unknown": "no other account can be connected to this server from here",
@@ -164,8 +164,8 @@ STR = {
         "why_expired": "токен без refresh истёк",
         "to_session": "MCP {server}: слетел вход, владелец знает. До входа его инструменты не работают — не повторяй "
                       "вызовы по кругу; работай без него или подожди, после входа хаб переподключит сервер.",
-        "status": "MCP: активны {ok}, слетели {bad}",
-        "status_first": "MCP: активны {ok}, слетели {bad}, не входили {first}",
+        "status": "MCP: подключены {ok}, слетели {bad}",
+        "status_first": "MCP: подключены {ok}, слетели {bad}, не входили {first}",
         "why_no_word": "работающие сессии пока о нём не говорят",
         "why_no_word_program": "программа, здесь не запускается: работающие сессии пока о ней не говорят",
         "switch_unknown": "к этому серверу отсюда другой аккаунт не подключить",
