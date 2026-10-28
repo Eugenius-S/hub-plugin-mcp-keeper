@@ -12,7 +12,7 @@ const STR = {
     reconnect: "Reconnect", reconnect_sent: "reconnecting…", reconnect_done: "reconnected",
     reconnect_fail: "did not come back", auto: "Reconnect automatically",
     auto_hint: "a lost server reconnects in the running sessions by itself, at most once in 10 min",
-    switch: "Connect another account", no_account: "no account", switch_sent: "opening a terminal…",
+    switch: "Another login", no_account: "no account", switch_sent: "opening a terminal…",
     switch_done: "terminal opened: follow the steps in it", switch_fail: "the terminal did not open",
     ignored: "Not followed",
     add: "Add MCP", add_name: "Name", add_url: "Address, https://…", add_go: "Add", add_cancel: "Cancel",
@@ -31,7 +31,7 @@ const STR = {
     reconnect: "Переподключить", reconnect_sent: "переподключаю…", reconnect_done: "переподключено",
     reconnect_fail: "не ожил", auto: "Автопереподключение",
     auto_hint: "отвалившийся сервер сам переподключается в работающих сессиях, не чаще раза в 10 мин",
-    switch: "Подключить другой", no_account: "без аккаунта", switch_sent: "открываю терминал…",
+    switch: "Другой логин", no_account: "без аккаунта", switch_sent: "открываю терминал…",
     switch_done: "терминал открыт: дальше по шагам в нём", switch_fail: "терминал не открылся",
     ignored: "Не следим",
     add: "Добавить MCP", add_name: "Название", add_url: "Адрес, https://…", add_go: "Добавить", add_cancel: "Отмена",
@@ -104,7 +104,7 @@ function button(cls, label, text, name, act, td) {
   return btn;
 }
 
-// The actions of a row: "Connect another account" for a connected server with a login of its own (the process opens a
+// The actions of a row: "Another login" for a connected server with a login of its own (the process opens a
 // terminal where the login is changed), "Reconnect" (the server reconnects in every running session, no login) for a lost
 // one, "Log in" / "Log in again" (the process runs `hub mcp login`) where a login can help; or what is going on now.
 function actionCell(row, name, s) {

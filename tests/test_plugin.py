@@ -1599,7 +1599,7 @@ class ViewReconnect(Base):
 
 
 class ViewSwitch(Base):
-    """0.7.0: a connected server has "Connect another account" instead of "Reconnect". The plugin cannot do it itself (the
+    """0.7.0: a connected server has "Another login" instead of "Reconnect". The plugin cannot do it itself (the
     login of Claude Code is not ours to write): the owner's click "switch <server>" opens a terminal with claude (a fake
     opener here - no window is opened)."""
 
@@ -1734,7 +1734,7 @@ class AllServers(Base):
 
 
 class SwitchKinds(Base):
-    """0.7.3: "Connect another account" for every connected server that has an account, and what the click does depends on
+    """0.7.3: "Another login" for every connected server that has an account, and what the click does depends on
     the kind: a stored login (claude), a program with a login of its own (MS365, Teams), a key (only the words for a
     person: nothing is read or written). A server without any account has no button, the row says so."""
     KEY = "glsa_supersecret"
@@ -1840,7 +1840,7 @@ class SwitchKinds(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.8.0")
+        self.assertEqual(m["version"], "0.8.1")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -1875,7 +1875,7 @@ console.log(JSON.stringify(out));
 
 
 class ViewButtons(unittest.TestCase):
-    """0.7.1: a connected server has only "Connect another account"; "Log in" stays for a lost one and a never-logged-in one.
+    """0.7.1: a connected server has only "Another login"; "Log in" stays for a lost one and a never-logged-in one.
     The page is run in node with a stub hub (no browser)."""
 
     def buttons(self, rows):
@@ -2056,6 +2056,38 @@ class ConnectedWord(unittest.TestCase):
         self.assertIn('ok: "подключен"', src)
         self.assertIn("Последний раз подключен", src)
         self.assertIn("подключены {ok}", main.STR["ru"]["status"])
+
+
+class AnotherLoginName(unittest.TestCase):
+    """0.8.1 (owner): the button of a connected server is "Another login" (ru: "Другой логин"), in the page, the manifest
+    and the README, and the old name is gone everywhere."""
+
+    OLD_EN = "Connect another account"
+    OLD_RU = "Подключить другой"   # Podklyuchit drugoy
+    NEW_RU = "Другой логин"   # Drugoy login
+
+    def src(self, name):
+        with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_page_labels_the_button_by_the_new_name(self):
+        js = self.src("main.js")
+        self.assertIn('switch: "Another login"', js)
+        self.assertIn('switch: "%s"' % self.NEW_RU, js)
+
+    def test_the_old_name_is_nowhere(self):
+        for name in ("main.js", "main.py", "hub-plugin.json", "README.md"):
+            text = self.src(name)
+            self.assertNotIn(self.OLD_EN, text, name)
+            self.assertNotIn(self.OLD_RU, text, name)
+
+    def test_the_manifest_and_the_readme_name_the_button(self):
+        m = read(os.path.join(ROOT, "hub-plugin.json"))
+        self.assertIn("Another login", m["description"])
+        self.assertIn(self.NEW_RU, m["i18n"]["ru"]["description"])
+        readme = self.src("README.md")
+        self.assertIn("**Another login**", readme)
+        self.assertIn("**%s**" % self.NEW_RU, readme)
 
 
 class CatalogRules(unittest.TestCase):

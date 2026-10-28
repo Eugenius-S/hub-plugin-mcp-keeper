@@ -90,7 +90,7 @@ UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" 
 HELPER_TIMEOUT = 30       # a headersHelper run over this is killed: "later"
 STATES = ("ok", "lost", "later", "first", "skip")
 HOLDERS = ("claude", "headers", "conduit", "auth-keeper", "mcp-remote", "program", "none", "local")
-ACCOUNTS = ("oauth", "key", "ms365", "workiq")   # 0.7.3: what "Connect another account" does for a row, see open_terminal
+ACCOUNTS = ("oauth", "key", "ms365", "workiq")   # 0.7.3: what "Another login" does for a row, see open_terminal
 OWNER_AFTER = 2           # cover: the owner hears of a loss only when this many more passes still see it
 READ_ONLY = ("conduit",)  # cover: logins another part of the hub refreshes - only looked at, never through claude
 LIVE = ("idle", "busy", "dialog")   # sessions with a process: their MCP status is Claude Code's own fresh word
@@ -1627,7 +1627,7 @@ def program_login(kind, srv):
 
 
 def open_terminal(server, hub_st, now, opener=None, kind=None):
-    """Connect another account (0.7.0, per kind 0.7.3): a connected server is not switched by the plugin - the login of
+    """Another login (0.7.0, per kind 0.7.3): a connected server is not switched by the plugin - the login of
     Claude Code is not ours to write, a key is not ours to read, and the hub has no command for either. The owner's click
     opens a terminal window; what it holds depends on `kind` (account_kind):
     oauth - `claude` (/mcp -> the server -> Clear authentication -> Authenticate, in the browser the other account);
@@ -1651,7 +1651,7 @@ def open_terminal(server, hub_st, now, opener=None, kind=None):
                                     **({"env": env} if env else {}))
     except OSError:
         return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_failed")}
-    print(time.strftime("%H:%M:%S"), "mcp-keeper: terminal for another account:", server, kind or "oauth", flush=True)
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: terminal for another login:", server, kind or "oauth", flush=True)
     return {"state": "done", "act": "switch", "at": now}
 
 

@@ -115,10 +115,10 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
 - **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
   your click on **Log in**, or after **Add MCP**), `claude mcp add` and `claude mcp remove` (only for the server you
   add: the second one takes it back if the hub refuses it), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
-  (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Connect
-  another account**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
+  (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Another
+  login**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
   when the server's own catalog entry names it.
-- **A terminal window, on a click.** On **Connect another account** the process writes a script into its own state
+- **A terminal window, on a click.** On **Another login** the process writes a script into its own state
   folder: `switch-<server>.cmd` on Windows, `switch-<server>.command` on macOS, `switch-<server>.sh` on Linux (the
   server name is cleaned to letters, digits and `._-`; shell characters in the hint are dropped), and opens it in a new
   terminal window that stays open. What the window holds depends on the server: for a server with a login in a browser
@@ -183,7 +183,7 @@ one).
 
 Buttons of a row:
 
-- **Connect another account** - on every connected server that has an account: posts `switch <server>`; the plugin
+- **Another login** - on every connected server that has an account: posts `switch <server>`; the plugin
   opens a terminal, by the kind of server:
   - a login in a browser (Atlassian, Figma, Canva and the like): `claude` in the login folder of that server and a
     hint: `/mcp`, the server, "Clear authentication", then "Authenticate" and pick the other account in the browser;
@@ -198,7 +198,7 @@ Buttons of a row:
 - **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the hub reconnects the server in every running
   session that has it (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the
   server again at once and the row shows the result.
-- **Log in** / **Log in again** - only for a lost server or one nobody logged in yet (a connected one has only "Connect another account"), and only for a server that logs in in a browser: posts `login <server>`; the process runs
+- **Log in** / **Log in again** - only for a lost server or one nobody logged in yet (a connected one has only "Another login"), and only for a server that logs in in a browser: posts `login <server>`; the process runs
   the same `hub mcp login <session> <server>` you would type in a terminal (a running session that has the server, else
   the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
   end, then the result (done, or why not); a login that went through makes the next check start at once.
@@ -219,20 +219,20 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 у программ и серверов без своего входа состояние берётся по слову работающих сессий. Серверы из `mcp_auth_ignore`
 (hub.json) показаны одной серой строкой «Не следим», без кнопок и тревог.
 
-У каждого подключенного сервера с аккаунтом кнопка **Подключить другой**: плагин открывает терминал. Сервер со входом в
+У каждого подключенного сервера с аккаунтом кнопка **Другой логин**: плагин открывает терминал. Сервер со входом в
 браузере: `claude` в папке входа и подсказка (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой
 аккаунт). MS365 и Teams: программа сервера выходит и входит заново (код устройства). Сервер с ключом (Grafana и
 подобные): только слова, где в сервисе взять новый ключ и что сказать хабу («смени ключ Grafana»). У сервера без
 аккаунта (локальная программа без ключа, публичные доки) кнопки нет, в строке серым «без аккаунта».
 Сам плагин подключенный вход не переключает: хранилище входов Claude Code ему писать нельзя, ключ он не читает и не
-пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключенного только **Подключить другой**. Подробнее выше, в разделе про вид.
+пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключенного только **Другой логин**. Подробнее выше, в разделе про вид.
 
 Что плагин читает, пишет и куда шлёт: читает `hub.json`, состояние хаба и сохранённые входы MCP Claude Code (только
 чтение); пишет только в свои места (`status.json` рядом с плагином, `state.json`, `login.json` и скрипт ниже в своей папке
 состояния, события в хаб через его spool); входы Claude Code и чужие файлы не пишет, и сам его код не пишет
 `~/.claude.json` и `hub.json`. Исключение, только по клику **Добавить MCP**: запущенные им программы пишут: `claude mcp
 add` добавляет сервер в `~/.claude.json`, `hub tools import mcp` в раздел `mcp` файла `hub.json`. В сеть процесс ходит только
-на собственный адрес сервера с сохранённым токеном. По клику **Подключить другой** процесс пишет скрипт
+на собственный адрес сервера с сохранённым токеном. По клику **Другой логин** процесс пишет скрипт
 `switch-<сервер>.cmd` (Windows), `.command` (macOS) или `.sh` (Linux) в свою папку состояния и открывает окно терминала:
 с `claude` в папке входа сервера, либо с собственной программой MS365 или Teams (из описания сервера в хабе: выход и
 вход заново), либо только со словами для сервера с ключом. Программа с необычным словом среди аргументов (ключ, символ
