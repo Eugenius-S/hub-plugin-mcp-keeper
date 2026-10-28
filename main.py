@@ -90,6 +90,7 @@ UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" 
 HELPER_TIMEOUT = 30       # a headersHelper run over this is killed: "later"
 STATES = ("ok", "lost", "later", "first", "skip")
 HOLDERS = ("claude", "headers", "conduit", "auth-keeper", "mcp-remote", "program", "none", "local")
+ACCOUNTS = ("oauth", "key", "ms365", "workiq")   # 0.7.3: what "Connect another account" does for a row, see open_terminal
 OWNER_AFTER = 2           # cover: the owner hears of a loss only when this many more passes still see it
 READ_ONLY = ("conduit",)  # cover: logins another part of the hub refreshes - only looked at, never through claude
 LIVE = ("idle", "busy", "dialog")   # sessions with a process: their MCP status is Claude Code's own fresh word
@@ -121,6 +122,12 @@ STR = {
         "switch_failed": "the terminal did not open",
         "switch_hint": "In Claude Code: /mcp, choose {name}, Clear authentication, then Authenticate. "
                        "In the browser choose the other account.",
+        "switch_hint_program": "{name} logs in with its own program: it signs out first, then asks for a new login "
+                               "(a code and a page to open). Sign in with the other account.",
+        "switch_hint_key": "{name} works with a key, not a browser login. To use another account: make a new key in "
+                           "the service's settings (where the old one came from) and tell the hub in the chat: "
+                           "change the {name} key.",
+        "switch_no_program": "the login program of this server was not found",
         "why_unclear": "no clear answer after {tries} tries",
         "why_first": "never logged in; sessions wait for it",
         "first": "MCP never logged in: {names} - sessions get these servers but nobody has logged in yet (not a lost "
@@ -173,6 +180,12 @@ STR = {
         "switch_failed": "терминал не открылся",
         "switch_hint": "В Claude Code: /mcp, выбери {name}, Clear authentication, затем Authenticate. "
                        "В браузере выбери другой аккаунт.",
+        "switch_hint_program": "{name} входит своей программой: она сначала выходит, потом просит новый вход "
+                               "(код и страницу, которую надо открыть). Войди под другим аккаунтом.",
+        "switch_hint_key": "{name} работает по ключу, а не по входу в браузере. Чтобы подключить другой аккаунт: "
+                           "сделай новый ключ в настройках сервиса (там же, где брал прежний) и скажи хабу в чате: "
+                           "смени ключ {name}.",
+        "switch_no_program": "программа входа этого сервера не найдена",
         "why_unclear": "нет ясного ответа после {tries} попыток",
         "why_first": "ни разу не входили, сессии ждут входа",
         "first": "MCP без входа: {names} — сессии получают эти серверы, но в них ещё ни разу не входили (это не слёт). "
@@ -1333,6 +1346,8 @@ def clean_status(data):
                             **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {}),
                             **({"can_login": True} if r.get("can_login") is True and r["state"] != "ok" else {}),
                             **({"can_switch": True} if r.get("can_switch") is True else {}),
+                            **({"account": r["account"]} if r.get("account") in ACCOUNTS else {}),
+                            **({"no_account": True} if r.get("no_account") is True else {}),
                             **({"ignored": True} if r.get("ignored") is True else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY,
             "auto": data.get("auto") is not False, "servers": rows}
@@ -1384,14 +1399,37 @@ def start_clean():
         write_json(status_path(), old)
 
 
-def view_row(n, s, ok_at, logged=()):
-    """One row of the view: the state, the name for a person (title), what can be pressed. can_switch - a live server
-    with a stored OAuth login: another account can be connected to it (a terminal, see open_terminal)."""
+def account_kind(srv, logged):
+    """What the "account" of a server is (0.7.3): "oauth" - a login stored by Claude Code; "ms365" / "workiq" - a program
+    with a login of its own; "key" - a key in the server's headers or environment; "none" - a server without any login
+    (a local program, public docs); None - the definition is unknown."""
+    if logged:
+        return "oauth"
+    if not isinstance(srv, dict):
+        return None
+    if srv.get("command"):
+        text = json.dumps(srv.get("args") or []) + " " + str(srv.get("command"))
+        env = srv.get("env") if isinstance(srv.get("env"), dict) else {}
+        return ("ms365" if "ms-365-mcp-server" in text else "workiq" if "@microsoft/workiq" in text else
+                "key" if any(AUTH_HEADER.search(str(k)) for k in env) else "none")
+    if keyed(srv):
+        return "key"
+    return "none" if srv.get("url") else None
+
+
+def view_row(n, s, ok_at, logged=(), servers=None):
+    """One row of the view: the state, the name for a person (title), what can be pressed. can_switch - a connected
+    server with an account: another one can be connected (a terminal, see open_terminal, what it runs depends on the
+    kind - `account`); no_account - a server without any: nothing to switch, the row says why."""
+    kind = None
+    if s["state"] == "ok" and not s.get("ignored"):   # a server not connected has no "another account" yet
+        kind = account_kind((cover_servers() if servers is None else servers).get(n), n in logged)
     return {"state": s["state"], "ok_at": ok_at.get(n), "title": human(n),
             **({"why": s["why"]} if s.get("why") else {}), **({"by": s["by"]} if s.get("by") else {}),
             **({"can_login": True} if s["state"] in ("lost", "first") and
                str(s.get("fix") or "").startswith("hub mcp login ") else {}),
-            **({"can_switch": True} if s["state"] == "ok" and n in logged else {}),
+            **({"can_switch": True, "account": kind} if s["state"] == "ok" and kind in ACCOUNTS else {}),
+            **({"no_account": True} if kind == "none" else {}),
             **({"ignored": True} if s.get("ignored") else {})}
 
 
@@ -1502,26 +1540,38 @@ def switch_folder(server, hub_st):
     return os.path.dirname(os.path.dirname(hub)) if hub else os.path.expanduser("~")
 
 
-def launch_terminal(folder, cmd, hint, server):
-    """A terminal window with `claude` in `folder` and the hint above it. A script file, not a command line: the quoting
-    of three shells is not touched. The window is the owner's; it stays open after claude ends."""
+SAFE_ARG = re.compile(r"[@A-Za-z0-9._/:=+-]{1,100}")   # what may stand in a script of a window: no quote, no space, no shell
+
+
+def launch_terminal(folder, cmd, hint, server, env=None):
+    """A terminal window in `folder` with the hint above `cmd`: one command (a list of words), several (a list of lists,
+    one after another), or none (the hint alone). `env` - plain settings (never a key), set for the commands. A script
+    file, not a command line: the quoting of three shells is not touched. The window is the owner's; it stays open after
+    the commands end."""
+    cmds = [] if not cmd else cmd if isinstance(cmd[0], list) else [cmd]
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", server)[:60]
     os.makedirs(HOME, exist_ok=True)
-    text =re.sub(r"[&|<>^%\"`$\\]", " ", hint)
+    text = re.sub(r"[&|<>^%\"`$\\]", " ", hint)
+    env = {k: v for k, v in (env or {}).items() if SAFE_ARG.fullmatch(k) and SAFE_ARG.fullmatch(v)}
     if os.name == "nt":
         script = os.path.join(HOME, "switch-" + safe + ".cmd")
-        lines = ["@echo off", "chcp 65001 >nul", 'cd /d "' + folder + '"', "echo.", "echo " + text, "echo.",
-                 "call " + subprocess.list2cmdline(cmd), "echo.", "pause"]
+        lines = ["@echo off", "chcp 65001 >nul", 'cd /d "' + folder + '"', "echo.", "echo " + text, "echo."]
+        lines += ['set "' + k + "=" + v + '"' for k, v in env.items()]
+        lines += ["call " + subprocess.list2cmdline(c) for c in cmds]
+        lines += ["echo.", "pause"]
         with open(script, "w", encoding="utf-8", newline="\r\n") as f:
             f.write("\n".join(lines) + "\n")
         subprocess.Popen(["cmd.exe", "/c", script], cwd=folder, close_fds=True,
                          creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
         return
     script = os.path.join(HOME, "switch-" + safe + (".command" if sys.platform == "darwin" else ".sh"))
-    quoted = " ".join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+    quote = lambda w: "'" + w.replace("'", "'\\''") + "'"
+    body = "".join("export " + k + "=" + quote(v) + "\n" for k, v in env.items())
+    body += "".join(" ".join(quote(w) for w in c) + "\n" for c in cmds)
+    tail = "" if sys.platform == "darwin" else "echo\nprintf 'Enter to close: '; read _\n"
     with open(script, "w", encoding="utf-8", newline="\n") as f:
-        f.write("#!/bin/sh\ncd '" + folder.replace("'", "'\\''") + "' || exit 1\necho\necho '" + text.replace("'", " ") +
-                "'\necho\n" + quoted + "\n")
+        f.write("#!/bin/sh\ncd " + quote(folder) + " || exit 1\necho\necho " + quote(text.replace("'", " ")) +
+                "\necho\n" + body + tail)
     os.chmod(script, 0o755)
     if sys.platform == "darwin":
         subprocess.Popen(["open", "-a", "Terminal", script], close_fds=True)
@@ -1532,19 +1582,54 @@ def launch_terminal(folder, cmd, hint, server):
     subprocess.Popen([term, "-e", "sh", script], close_fds=True)
 
 
-def open_terminal(server, hub_st, now, opener=None):
-    """"Connect another account": a live server is not switched by the plugin - the login of Claude Code is not ours to
-    write, and the hub has no command for it. The owner's click opens a terminal with `claude` (/mcp -> the server ->
-    Clear authentication -> Authenticate, in the browser the other account); the row says it. -> the login-file row."""
-    cmd = claude_cmd()
-    if not cmd:
-        return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_noclaude")}
-    hint = tr("switch_hint", name=human(server))
+def program_login(kind, srv):
+    """([sign-out command, login command], env) of a program with a login of its own, from the hub's own description of
+    the server (words only; an unusual word - a key among the arguments - refuses); None - no such program here."""
+    if not isinstance(srv, dict) or not srv.get("command"):
+        return None
+    args = [a for a in (srv.get("args") or []) if isinstance(a, str)]
+    if len(args) != len(srv.get("args") or []) or not all(SAFE_ARG.fullmatch(a) and not AUTH_HEADER.search(a) for a in args):
+        return None
+    cmd = str(srv["command"])
+    if not shutil.which(cmd) and not os.path.isfile(cmd):
+        return None
+    if kind == "ms365":   # @softeria/ms-365-mcp-server: --logout, then --login (a device code); the same words as the server
+        cmds = [[cmd] + args + ["--logout"], [cmd] + args + ["--login"]]
+    elif kind == "workiq":   # @microsoft/workiq: `auth logout`, `auth login` (the Windows account or a page of Microsoft)
+        base = args[:args.index("mcp")] if "mcp" in args else args
+        cmds = [[cmd] + base + ["auth", "logout"], [cmd] + base + ["auth", "login"]]
+    else:
+        return None
+    env = srv.get("env") if isinstance(srv.get("env"), dict) else {}
+    return cmds, {k: v for k, v in env.items() if isinstance(v, str) and not AUTH_HEADER.search(str(k))}
+
+
+def open_terminal(server, hub_st, now, opener=None, kind=None):
+    """Connect another account (0.7.0, per kind 0.7.3): a connected server is not switched by the plugin - the login of
+    Claude Code is not ours to write, a key is not ours to read, and the hub has no command for either. The owner's click
+    opens a terminal window; what it holds depends on `kind` (account_kind):
+    oauth - `claude` (/mcp -> the server -> Clear authentication -> Authenticate, in the browser the other account);
+    ms365 / workiq - the server's own program signs out and logs in again; key - only the words for a person (a new key
+    comes from the service, the hub changes it on a word in the chat; nothing is written here). -> the login-file row."""
+    folder, env = None, None
+    if kind == "key":
+        cmd, hint = [], tr("switch_hint_key", name=human(server))
+    elif kind in ("ms365", "workiq"):
+        found = program_login(kind, cover_servers().get(server))
+        if not found:
+            return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_no_program")}
+        (cmd, env), hint, folder = found, tr("switch_hint_program", name=human(server)), os.path.expanduser("~")
+    else:
+        cmd = claude_cmd()
+        if not cmd:
+            return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_noclaude")}
+        hint = tr("switch_hint", name=human(server))
     try:
-        (opener or launch_terminal)(switch_folder(server, hub_st), cmd, hint, server)
+        (opener or launch_terminal)(folder or switch_folder(server, hub_st), cmd, hint, server,
+                                    **({"env": env} if env else {}))
     except OSError:
         return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_failed")}
-    print(time.strftime("%H:%M:%S"), "mcp-keeper: terminal for another account:", server, flush=True)
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: terminal for another account:", server, kind or "oauth", flush=True)
     return {"state": "done", "act": "switch", "at": now}
 
 
@@ -1621,7 +1706,7 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
             if server not in switchable:
                 rows[server] = {"state": "fail", "act": "switch", "at": now, "why": tr("switch_unknown")}
             else:
-                rows[server] = open_terminal(server, hub_st, now, opener)
+                rows[server] = open_terminal(server, hub_st, now, opener, (known.get(server) or {}).get("account"))
             changed = True
             continue
         if (rows.get(server) or {}).get("state") == "wait":

@@ -1586,10 +1586,114 @@ class AllServers(Base):
         self.assertIn("figma", res)
 
 
+class SwitchKinds(Base):
+    """0.7.3: "Connect another account" for every connected server that has an account, and what the click does depends on
+    the kind: a stored login (claude), a program with a login of its own (MS365, Teams), a key (only the words for a
+    person: nothing is read or written). A server without any account has no button, the row says so."""
+    KEY = "glsa_supersecret"
+    HEAD = "k-secret-header"
+
+    def setUp(self):
+        super().setUp()
+        servers = {
+            "figma": {"type": "http", "url": URLS["figma"]},
+            "grafana": {"command": "uvx", "args": ["mcp-grafana"],
+                        "env": {"GRAFANA_URL": "https://g.example/", "GRAFANA_SERVICE_ACCOUNT_TOKEN": self.KEY}},
+            "keyed": {"type": "http", "url": "https://k.example/mcp", "headers": {"X-Api-Key": self.HEAD}},
+            "ms365": {"command": "npx", "args": ["-y", "@softeria/ms-365-mcp-server@0.158.0", "--org-mode"], "env": {}},
+            "teams": {"command": "npx", "args": ["-y", "@microsoft/workiq", "mcp"], "env": {}},
+            "docs": {"type": "http", "url": "https://docs.example/mcp"},
+            "pencil": {"command": "pencil"},
+        }
+        self.config({"mcp": {n: {"server": v} for n, v in servers.items()}})
+        self.hub["sessions"]["worker"]["info"]["mcp"] = list(servers)
+        self.hub["feeds"] = {main.NAME: []}
+        self.opened = []
+        self.opener = lambda folder, cmd, hint, server, env=None: self.opened.append((folder, cmd, hint, server, env))
+        p = mock.patch.object(main.shutil, "which", lambda c, *a, **k: c)   # the programs are "installed"
+        p.start()
+        self.addCleanup(p.stop)
+        self.run_once()
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def click(self, *names):
+        for i, n in enumerate(names, 1):
+            self.hub["feeds"][main.NAME].append({"id": f"p{i}", "by": "owner", "text": "switch " + n, "ts": NOW})
+        main.login_step(NOW + 1, opener=self.opener)
+
+    def test_every_connected_server_with_an_account_has_the_button(self):
+        rows = self.rows()
+        for name, kind in (("figma", "oauth"), ("grafana", "key"), ("keyed", "key"), ("ms365", "ms365"),
+                           ("teams", "workiq")):
+            self.assertEqual((rows[name]["state"], rows[name].get("can_switch"), rows[name].get("account")),
+                             ("ok", True, kind), name)
+            self.assertNotIn("no_account", rows[name], name)
+
+    def test_a_server_without_an_account_has_no_button_and_says_why(self):
+        rows = self.rows()
+        for name in ("docs", "pencil"):
+            self.assertTrue(rows[name]["no_account"], name)
+            self.assertNotIn("can_switch", rows[name], name)
+        self.click("docs", "pencil")
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.rows()["docs"]["login"]["state"], "fail")
+
+    def test_a_key_server_gets_the_words_for_a_person_and_nothing_else(self):
+        self.click("grafana")
+        (folder, cmd, hint, server, env), = self.opened
+        self.assertEqual((server, cmd, env), ("grafana", [], None), "no program, no settings")
+        self.assertIn("Grafana", hint)
+        self.assertIn("new key", hint)
+        self.assertIn("change the Grafana key", hint)
+        self.assertNotIn("hub.json", hint)
+        self.assertEqual(self.rows()["grafana"]["login"], {"state": "done", "at": NOW + 1, "act": "switch"})
+
+    def test_ms365_and_teams_sign_out_and_in_with_their_own_program(self):
+        self.click("ms365", "teams")
+        by = {server: (cmd, env) for _, cmd, _, server, env in self.opened}
+        self.assertEqual(by["ms365"][0], [["npx", "-y", "@softeria/ms-365-mcp-server@0.158.0", "--org-mode", "--logout"],
+                                          ["npx", "-y", "@softeria/ms-365-mcp-server@0.158.0", "--org-mode", "--login"]])
+        self.assertEqual(by["teams"][0], [["npx", "-y", "@microsoft/workiq", "auth", "logout"],
+                                          ["npx", "-y", "@microsoft/workiq", "auth", "login"]])
+
+    def test_a_program_with_a_key_among_its_arguments_is_not_run(self):
+        self.config({"mcp": {"ms365": {"server": {"command": "npx", "args": ["-y", "ms-365-mcp-server", "--token=abc"]}}}})
+        self.hub["sessions"]["worker"]["info"]["mcp"] = ["ms365"]
+        self.run_once()
+        self.click("ms365")
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.rows()["ms365"]["login"]["why"], main.tr("switch_no_program"))
+
+    def test_the_oauth_server_still_gets_claude(self):
+        self.click("figma")
+        (_, cmd, hint, server, env), = self.opened
+        self.assertEqual((server, cmd, env), ("figma", main.claude_cmd(), None))
+        self.assertIn("Authenticate", hint)
+
+    def test_no_key_reaches_the_status_or_the_login_file(self):
+        self.click("grafana", "keyed", "ms365")
+        for path in (os.environ["MCP_KEEPER_STATUS"], main.login_path()):
+            text = read(path, raw=True)
+            self.assertNotIn(self.KEY, text)
+            self.assertNotIn(self.HEAD, text)
+
+    def test_the_script_runs_the_commands_one_after_another(self):
+        if os.name != "nt":
+            self.skipTest("the .cmd script is a Windows thing")
+        with mock.patch.object(subprocess, "Popen"):
+            main.launch_terminal(TMP, [["a", "one"], ["a", "two"]], "words", "ms365", {"ORG": "x", "BAD": "a b"})
+        script = read(os.path.join(main.HOME, "switch-ms365.cmd"), raw=True)
+        self.assertLess(script.index("call a one"), script.index("call a two"))
+        self.assertIn('set "ORG=x"', script)
+        self.assertNotIn("BAD", script, "a setting with a space or a quote is not written into a script")
+
+
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.7.2")
+        self.assertEqual(m["version"], "0.7.3")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -1615,6 +1719,7 @@ const out = {};
 const walk = (n, row) => {
   if (n.tag === "tr" && n.kids[0] && n.kids[0].tag === "td") row = n.kids[0].text;
   if (n.tag === "button") (out[row] = out[row] || []).push(n.cls.replace("btn ", ""));
+  if (n.cls === "mk-noacc") (out[row + ":grey"] = out[row + ":grey"] || []).push(n.text);
   n.kids.forEach((k) => k && k.tag && walk(k, row));
 };
 walk(root, "");
@@ -1648,6 +1753,13 @@ class ViewButtons(unittest.TestCase):
     def test_an_active_server_without_a_login_of_its_own_has_no_buttons(self):
         got = self.buttons({"canva": {"state": "ok", "title": "Canva", "can_login": True}})
         self.assertEqual(got, {})
+
+    def test_a_server_without_an_account_shows_grey_words_and_no_button(self):
+        got = self.buttons({"docs": {"state": "ok", "title": "Docs", "no_account": True},
+                            "figma": {"state": "ok", "title": "Figma", "can_switch": True}})
+        self.assertEqual(got["Docs:grey"], ["no account"])
+        self.assertNotIn("Docs", got)
+        self.assertNotIn("Figma:grey", got)
 
     def test_the_process_never_gives_an_active_row_a_login(self):
         got = main.clean_status({"servers": {"a": {"state": "ok", "can_login": True, "can_switch": True},

@@ -112,14 +112,20 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
   redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
 - **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
   your click on **Log in**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
-  (a list of processes, to tell who holds a lost one-time login), and the terminal below. A `headersHelper` runs only
+  (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Connect
+  another account**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
   when the server's own catalog entry names it.
 - **A terminal window, on a click.** On **Connect another account** the process writes a script into its own state
   folder: `switch-<server>.cmd` on Windows, `switch-<server>.command` on macOS, `switch-<server>.sh` on Linux (the
-  server name is cleaned to letters, digits and `._-`; shell characters in the hint are dropped). The script goes to the
-  login folder of that server and starts `claude` there, in a new terminal window that stays open. Only your own click
-  in the view starts it; nothing opens a window by itself. The script keeps no secret: a folder, a hint and the `claude`
-  command.
+  server name is cleaned to letters, digits and `._-`; shell characters in the hint are dropped), and opens it in a new
+  terminal window that stays open. What the window holds depends on the server: for a server with a login in a browser
+  it starts `claude` in the login folder of that server; for MS365 and Teams it runs the server's own program, taken
+  from the hub's description of the server, to sign out and sign in again (the same words the server starts with,
+  plus `--logout`, then `--login`; or `auth logout`, `auth login`); for a server with a key (a header or an
+  environment variable) it starts no program, only the words: where to get a new key and what to tell the hub. A
+  program with an unusual word among its arguments (a key, a shell character) is not run. Only your own click in the
+  view starts it; nothing opens a window by itself. The script keeps no secret: a folder, a hint and the program's
+  words; no key is read, shown or written, and no new address is called.
 
 The plugin asks for the page and the process, nothing more.
 
@@ -165,12 +171,18 @@ one).
 
 Buttons of a row:
 
-- **Connect another account** - on a connected server that has a login of its own: posts `switch <server>`; the plugin
-  opens a terminal with `claude` in the login folder of that server and a hint: `/mcp`, the server, "Clear
-  authentication", then "Authenticate" and pick the other account in the browser. A connected login is never switched by
-  the plugin itself: Claude Code keeps its logins in a store the plugin must not write to, and `claude mcp logout` would
-  wipe the login. A hub command for this (a login under another account, or a logout of one server, run by the hub)
-  would replace the terminal. The row says "terminal opened" or why it did not open.
+- **Connect another account** - on every connected server that has an account: posts `switch <server>`; the plugin
+  opens a terminal, by the kind of server:
+  - a login in a browser (Atlassian, Figma, Canva and the like): `claude` in the login folder of that server and a
+    hint: `/mcp`, the server, "Clear authentication", then "Authenticate" and pick the other account in the browser;
+  - MS365 and Teams: the server's own program signs out and then signs in again (a device code or a page of Microsoft);
+  - a key in a header or an environment variable (Grafana and the like): words only, where to get a new key in the
+    service and what to tell the hub in the chat ("change the Grafana key").
+  A connected login is never switched by the plugin itself: Claude Code keeps its logins in a store the plugin must not
+  write to, a key is not the plugin's to read or write, and `claude mcp logout` would wipe the login. A hub command for
+  this would replace the terminal. The row says "terminal opened" or why it did not open.
+- **no account** (grey words, no button) - a connected server without any account: a local program with no key, public
+  docs.
 - **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the hub reconnects the server in every running
   session that has it (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the
   server again at once and the row shows the result.
@@ -195,18 +207,23 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 у программ и серверов без своего входа состояние берётся по слову работающих сессий. Серверы из `mcp_auth_ignore`
 (hub.json) показаны одной серой строкой «Не следим», без кнопок и тревог.
 
-У подключенного сервера со своим входом кнопка **Подключить другой**: плагин открывает терминал с `claude` в папке входа
-этого сервера и подсказкой (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой аккаунт в браузере).
-Сам плагин подключенный вход не переключает: хранилище входов Claude Code ему писать нельзя, а `claude mcp logout` стирает
-вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключенного только **Подключить другой**. Подробнее выше, в разделе про вид.
+У каждого подключенного сервера с аккаунтом кнопка **Подключить другой**: плагин открывает терминал. Сервер со входом в
+браузере: `claude` в папке входа и подсказка (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой
+аккаунт). MS365 и Teams: программа сервера выходит и входит заново (код устройства). Сервер с ключом (Grafana и
+подобные): только слова, где в сервисе взять новый ключ и что сказать хабу («смени ключ Grafana»). У сервера без
+аккаунта (локальная программа без ключа, публичные доки) кнопки нет, в строке серым «без аккаунта».
+Сам плагин подключенный вход не переключает: хранилище входов Claude Code ему писать нельзя, ключ он не читает и не
+пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключенного только **Подключить другой**. Подробнее выше, в разделе про вид.
 
 Что плагин читает, пишет и куда шлёт: читает `hub.json`, состояние хаба и сохранённые входы MCP Claude Code (только
 чтение); пишет только в свои места (`status.json` рядом с плагином, `state.json`, `login.json` и скрипт ниже в своей папке
 состояния, события в хаб через его spool); входы Claude Code, `~/.claude.json` и `hub.json` не пишет; в сеть ходит только
 на собственный адрес сервера с сохранённым токеном. По клику **Подключить другой** процесс пишет скрипт
-`switch-<сервер>.cmd` (Windows), `.command` (macOS) или `.sh` (Linux) в свою папку состояния и открывает окно терминала с
-`claude` в папке входа этого сервера. Окно открывает только ваш клик, секретов в скрипте нет. Права плагина: страница и
-процесс.
+`switch-<сервер>.cmd` (Windows), `.command` (macOS) или `.sh` (Linux) в свою папку состояния и открывает окно терминала:
+с `claude` в папке входа сервера, либо с собственной программой MS365 или Teams (из описания сервера в хабе: выход и
+вход заново), либо только со словами для сервера с ключом. Программа с необычным словом среди аргументов (ключ, символ
+оболочки) не запускается. Окно открывает только ваш клик, секретов в скрипте нет, ключи не читаются и не пишутся, новых
+адресов нет. Права плагина: страница и процесс.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 

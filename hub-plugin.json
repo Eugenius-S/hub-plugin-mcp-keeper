@@ -3,7 +3,7 @@
   "icon": "icon.png",
   "description": "Every 15 minutes checks the logins (OAuth and API keys) of the MCP servers the hub gives to sessions and warns the owner once, before a lost login stops work. The view lists each server by name: connected or lost, when it was last connected; buttons to connect another account, reconnect, log in.",
   "why": "A lost MCP login is found by the owner, not by a stuck session: the plugin notices it within 15 minutes and says how to log in, once",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "i18n": {
     "ru": {
       "description": "Раз в 15 минут проверяет входы (OAuth и ключи) MCP-серверов, которые хаб выдаёт сессиям, и один раз предупреждает владельца, пока слетевший вход не остановил работу. Вид показывает серверы по имени: подключен или отвалился, когда был подключен; кнопки «Подключить другой», «Переподключить», «Войти».",

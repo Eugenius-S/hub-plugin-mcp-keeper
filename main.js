@@ -12,8 +12,8 @@ const STR = {
     reconnect: "Reconnect", reconnect_sent: "reconnecting…", reconnect_done: "reconnected",
     reconnect_fail: "did not come back", auto: "Reconnect automatically",
     auto_hint: "a lost server reconnects in the running sessions by itself, at most once in 10 min",
-    switch: "Connect another account", switch_sent: "opening a terminal…",
-    switch_done: "terminal opened: sign in with the other account there", switch_fail: "the terminal did not open",
+    switch: "Connect another account", no_account: "no account", switch_sent: "opening a terminal…",
+    switch_done: "terminal opened: follow the steps in it", switch_fail: "the terminal did not open",
     ignored: "Not followed",
   },
   ru: {
@@ -27,8 +27,8 @@ const STR = {
     reconnect: "Переподключить", reconnect_sent: "переподключаю…", reconnect_done: "переподключено",
     reconnect_fail: "не ожил", auto: "Автопереподключение",
     auto_hint: "отвалившийся сервер сам переподключается в работающих сессиях, не чаще раза в 10 мин",
-    switch: "Подключить другой", switch_sent: "открываю терминал…",
-    switch_done: "терминал открыт: войди там под другим аккаунтом", switch_fail: "терминал не открылся",
+    switch: "Подключить другой", no_account: "без аккаунта", switch_sent: "открываю терминал…",
+    switch_done: "терминал открыт: дальше по шагам в нём", switch_fail: "терминал не открылся",
     ignored: "Не следим",
   },
 };
@@ -120,6 +120,11 @@ function actionCell(row, name, s) {
   else if (s.state !== "skip" && s.state !== "ok") bar.append(button("mk-reconnect", "reconnect", "reconnect_sent", name, "reconnect", td));
   if (s.can_login && s.state !== "ok") bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
   if (bar.firstChild) td.append(bar);
+  else if (s.no_account) {
+    const grey = hub.el("span", "mk-noacc", tr("no_account"));
+    grey.style.cssText = "opacity:.55";
+    td.append(grey);
+  }
 }
 
 function autoBox(d) {
@@ -165,7 +170,7 @@ function draw(root) {
     th.style.cssText = "text-align:left;padding:6px 8px;opacity:.7;font-weight:500";
     head.append(th);
   }
-  const acts = (s) => s.can_switch || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
+  const acts = (s) => s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
   const withActs = shown.some(([, s]) => acts(s));
   if (withActs) head.append(hub.el("th"));
   table.append(head);
