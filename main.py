@@ -77,6 +77,12 @@ LOGIN_LIVE = 360          # a login that waits longer has ended (the hub waits 3
 LOGIN_RUN = 75            # the `hub mcp login` command itself (it returns once the link is open) - limit, seconds
 LOGIN_SHOW = 3600         # a finished login stays in the row this long
 TRIES = 3
+RETRIES = 3               # a server the pass could not judge is asked again this many times before it shows as lost
+RETRY_PAUSE = 20          # seconds between those tries (sessions reconnect it in between, when auto is on)
+AUTO_EVERY = 600          # auto reconnect of one server - not more often than this
+RECONNECT_WAIT = 15       # a reconnect from the view: the sessions take it in, then this one server is checked again
+RECHECK_ASYNC = True      # tests: the check after a click runs in the same thread
+LOCK = threading.Lock()   # one pass at a time: the loop and the check after a click write the same state
 NET_HOSTS = (("api.anthropic.com", 443), ("github.com", 443))
 KEYCHAIN = "Claude Code-credentials"
 UA = "hub-mcp-keeper (mcp-remote compatible)"   # Cloudflare answers 403 "1010" to Python-urllib
@@ -105,8 +111,9 @@ STR = {
         "why_expired": "the token without refresh has expired",
         "to_session": "MCP {server}: the login is lost, the owner is told. Its tools fail until then - do not repeat "
                       "the calls in a loop; work without it or wait, the hub reconnects it after the login.",
-        "status": "MCP: {ok} live, {bad} lost, {later} later",
-        "status_first": "MCP: {ok} live, {bad} lost, {later} later, {first} never logged in",
+        "status": "MCP: {ok} live, {bad} lost",
+        "status_first": "MCP: {ok} live, {bad} lost, {first} never logged in",
+        "why_unclear": "no clear answer after {tries} tries",
         "why_first": "never logged in; sessions wait for it",
         "first": "MCP never logged in: {names} - sessions get these servers but nobody has logged in yet (not a lost "
                  "login). One login per server is enough, every session picks it up:",
@@ -127,6 +134,7 @@ STR = {
         "dev": "MCP: first sign of a lost login (the owner hears only if it stays lost for {passes} more passes):",
         "dev_line": "\u2022 {name} ({by}) - {why}: {fix}",
         "login_unknown": "no login from this view for this server",
+        "reconnect_unknown": "the hub does not give this server to sessions",
         "login_nohub": "the hub command was not found",
         "login_failed": "the login did not go through (code {code})",
         "login_timeout": "no login within {minutes} min",
@@ -148,8 +156,9 @@ STR = {
         "why_expired": "токен без refresh истёк",
         "to_session": "MCP {server}: слетел вход, владелец знает. До входа его инструменты не работают — не повторяй "
                       "вызовы по кругу; работай без него или подожди, после входа хаб переподключит сервер.",
-        "status": "MCP: живы {ok}, слетели {bad}, позже {later}",
-        "status_first": "MCP: живы {ok}, слетели {bad}, позже {later}, не входили {first}",
+        "status": "MCP: живы {ok}, слетели {bad}",
+        "status_first": "MCP: живы {ok}, слетели {bad}, не входили {first}",
+        "why_unclear": "нет ясного ответа после {tries} попыток",
         "why_first": "ни разу не входили, сессии ждут входа",
         "first": "MCP без входа: {names} — сессии получают эти серверы, но в них ещё ни разу не входили (это не слёт). "
                  "Хватит одного входа на сервер, все сессии подхватят:",
@@ -170,6 +179,7 @@ STR = {
         "dev": "MCP: первый признак слёта входа (владелец узнает, только если не оживёт ещё {passes} прохода):",
         "dev_line": "\u2022 {name} ({by}) — {why}: {fix}",
         "login_unknown": "для этого сервера вход отсюда не запускается",
+        "reconnect_unknown": "хаб не выдаёт этот сервер сессиям",
         "login_nohub": "команда hub не найдена",
         "login_failed": "вход не прошёл (код {code})",
         "login_timeout": "не вошли за {minutes} мин",
@@ -573,9 +583,36 @@ def probe_with(url, auth):
             if 300 <= e.code < 400:   # moved: nobody judged the login
                 return None, e.code
             return (False if e.code in (401, 403) else True if e.code < 500 else None), e.code
-        except Exception:   # noqa: BLE001 - network: once more without the proxy, then "cannot tell"
+        except Exception:   # noqa: BLE001 - network: once more without the proxy, then curl, then "cannot tell"
             continue
-    return None, None
+    code = curl_status(url, head, body)   # Python on Windows may not trust a certificate curl trusts (the system store)
+    if code is None:
+        return None, None
+    if 300 <= code < 400:
+        return None, code
+    return (False if code in (401, 403) else True if code < 500 else None), code
+
+
+def curl_quote(value):
+    b = chr(92)
+    return '"' + str(value).replace(b, b + b).replace('"', b + '"').replace("\r", "").replace("\n", "") + '"'
+
+
+def curl_status(url, head, body):
+    """The HTTP code of the same initialize through curl, or None. The headers and the body go in the config on stdin
+    (never in the command line: other processes see it); no redirects, the answer goes nowhere."""
+    curl = shutil.which("curl")
+    if not curl:
+        return None
+    lines = [f"header = {curl_quote(k + ': ' + v)}" for k, v in head.items()]
+    lines += [f"data = {curl_quote(body.decode())}", f"url = {curl_quote(url)}", "silent", "max-redirs = 0",
+              f"output = {curl_quote(os.devnull)}", 'write-out = "%{http_code}"', "max-time = 30"]
+    try:
+        r = subprocess.run([curl, "-K", "-"], input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").strip()
+    return int(out) if out.isdigit() and int(out) > 0 else None
 
 
 def net_up():
@@ -899,7 +936,7 @@ def ask(name, ent, now, st, conf, url=None):
     return verdict
 
 
-def checkup(conf, now, st, hub, hub_st):
+def checkup(conf, now, st, hub, hub_st, only=None):
     """{servers: {name: {state, why, fix}}, logged} for what the hub gives to sessions; states: ok | lost | later | first.
     A live access is asked of the server itself (initialize); an expired one - of Claude Code, about this server only,
     and where it cannot tell (a hub catalog server) - of the hub's live sessions. A headers server - its helper runs
@@ -909,7 +946,7 @@ def checkup(conf, now, st, hub, hub_st):
     out, logged = {}, []
     catalog = set(catalog_servers()) if cover else None
     for name, url in sorted(served(hub_st, cover).items()):
-        if ignored(name, ignore):
+        if ignored(name, ignore) or (only is not None and name not in only):
             continue
         fix = login_fix(name, hub, catalog)
         if cover and url and local_url(url):   # a server on this machine (a desktop app): nothing to log in to
@@ -963,7 +1000,7 @@ def checkup(conf, now, st, hub, hub_st):
             row = lose(tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
         out[name] = {**row, "by": by} if cover else row
     for name, srv in sorted(header_servers(cover).items()):
-        if ignored(name, ignore) or name in out:
+        if ignored(name, ignore) or name in out or (only is not None and name not in only):
             continue
         head, why = helper_headers(srv)
         fix = tr("fix_headers", name=name) if name in catalog_servers() else tr("fix_mcp", name=name)
@@ -975,7 +1012,7 @@ def checkup(conf, now, st, hub, hub_st):
                    else {"state": "ok"} if ok else {"state": "later"})
         out[name] = {**row, "by": "headers"} if cover else row
     if cover:
-        programs(conf, now, out, logged, had, hub, catalog)
+        programs(conf, now, out, logged, had, hub, catalog, only)
     else:   # 0.3.0 rows: no holder
         for r in out.values():
             r.pop("by", None)
@@ -995,11 +1032,11 @@ def read_only_row(ent, now, lose):
     return lose(tr("why_expired"))
 
 
-def programs(conf, now, out, logged, had, hub, catalog):
+def programs(conf, now, out, logged, had, hub, catalog, only=None):
     """cover: stdio servers - never started. mcp-remote: its stored login is read (never refreshed: mcp-remote does it
     at its start, auth-keeper ahead); the Microsoft 365 program is auth-keeper's; any other program is skipped."""
     for name, srv in sorted(cover_servers().items()):
-        if name in out or ignored(name, conf["ignore"]) or not isinstance(srv, dict) or not srv.get("command"):
+        if name in out or ignored(name, conf["ignore"]) or not isinstance(srv, dict) or not srv.get("command") or                 (only is not None and name not in only):
             continue
         url = remote_url(srv)
         holder = "auth-keeper" if conf["auth_keeper"] else "mcp-remote"
@@ -1018,7 +1055,7 @@ def programs(conf, now, out, logged, had, hub, catalog):
             elif tok["refresh"] and conf["auth_keeper"]:   # it refreshes 2 h ahead: expired means it did not
                 out[name] = {"state": "lost", "why": tr("why_remote_expired"), "fix": fix, "by": holder}
             elif tok["refresh"]:
-                out[name] = {"state": "later", "why": tr("why_remote_later"), "by": holder}
+                out[name] = {"state": "skip", "why": tr("why_remote_later"), "by": holder}
             else:
                 out[name] = {"state": "lost", "why": tr("why_expired"), "fix": fix, "by": holder}
         elif "ms-365-mcp-server" in json.dumps(srv.get("args") or []) + str(srv.get("command")):
@@ -1065,6 +1102,53 @@ def calm_pass(conf, now, st, hub, hub_st):
         if s["state"] == "lost":
             res["servers"][n] = {"state": "later"}
     return res
+
+
+def unclear(res):
+    return sorted(n for n, s in res["servers"].items() if s["state"] in ("later", "failed"))
+
+
+def settle(res, conf, now, st, hub, hub_st):
+    """The view shows only live or lost (owner 28.10): a server the pass could not judge is asked again RETRIES times,
+    RETRY_PAUSE apart, reconnected in the sessions before each try when auto is on. What still has no answer is shown
+    lost with the reason; it is marked unclear - no alarm rests on it (it may be the network)."""
+    catalog = set(catalog_servers()) if conf.get("cover") else None
+    for i in range(RETRIES):
+        names = unclear(res)
+        if not names:
+            break
+        if st.get("auto", True):
+            auto_step(st, names, now, conf)
+        time.sleep(RETRY_PAUSE)
+        again = checkup(conf, now + RETRY_PAUSE * (i + 1), st, hub, hub_st, only=set(names))
+        for n in names:
+            if n in again["servers"]:
+                res["servers"][n] = again["servers"][n]
+        res["logged"] = sorted(set(res["logged"]) | set(again["logged"]))
+    for n in unclear(res):
+        s = res["servers"][n]
+        why = tr("why_unclear", tries=RETRIES + 1) + ("; " + s["why"] if s.get("why") else "")
+        res["servers"][n] = {**s, "state": "lost", "why": why, "unclear": True,
+                             "fix": s.get("fix") or login_fix(n, hub, catalog)}
+    return res
+
+
+def auto_step(st, names, now, conf):
+    """Auto reconnect: each server of `names` reconnected in every live session that has it, once in AUTO_EVERY;
+    never a one-time login (canva: nothing of it is touched)."""
+    done = st.setdefault("reconnected", {})
+    for n in list(done):
+        if now - done[n] >= DAY:
+            del done[n]
+    sent = []
+    for n in names:
+        if short(n) in conf["one_time"] or now - done.get(n, -DAY) < AUTO_EVERY:
+            continue
+        put("mcp.reconnect", {"server": n})
+        done[n] = now
+        sent.append(n)
+        print(time.strftime("%H:%M:%S"), "mcp-keeper: reconnect", n, flush=True)
+    return sent
 
 
 def remember(st, key, names, now, doubt, every=DAY):
@@ -1184,10 +1268,13 @@ def clean_status(data):
     for n, r in (data.get("servers") if isinstance(data.get("servers"), dict) else {}).items():
         if isinstance(r, dict) and r.get("state") in STATES:
             why = r.get("why") if isinstance(r.get("why"), str) and len(r["why"]) <= 160 and "://" not in r["why"] else None
-            rows[str(n)] = {"state": r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
+            if r["state"] in ("later", "failed"):   # before 0.6.0: the view shows only live or lost
+                why = tr("why_unclear", tries=RETRIES + 1) + ("; " + why if why else "")
+            rows[str(n)] = {"state": "lost" if r["state"] in ("later", "failed") else r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
                             **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {}),
                             **({"can_login": True} if r.get("can_login") is True else {})}
-    return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY, "servers": rows}
+    return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY,
+            "auto": data.get("auto") is not False, "servers": rows}
 
 
 def write_status(st):
@@ -1195,12 +1282,14 @@ def write_status(st):
     state of the logins the owner started from the view on top."""
     if not st.get("status"):
         return
-    out = {**st["status"], "servers": {n: dict(r) for n, r in st["status"]["servers"].items()}}
+    out = {**st["status"], "auto": st.get("auto", True) is not False,
+           "servers": {n: dict(r) for n, r in st["status"]["servers"].items()}}
     now = time.time()
     for n, r in ((read_json(login_path()) or {}).get("rows") or {}).items():
         if n in out["servers"] and isinstance(r, dict) and now - (r.get("at") or 0) < LOGIN_SHOW:
             why = r.get("why") if isinstance(r.get("why"), str) and "://" not in r["why"] else None
-            out["servers"][n]["login"] = {"state": r.get("state"), "at": r.get("at"), **({"why": why[:160]} if why else {})}
+            out["servers"][n]["login"] = {"state": r.get("state"), "at": r.get("at"), **({"why": why[:160]} if why else {}),
+                                          **({"act": "reconnect"} if r.get("act") == "reconnect" else {})}
     write_json(status_path(), out)
 
 
@@ -1241,12 +1330,12 @@ def post_status(st, res, conf, now):
                 **({"can_login": True} if s["state"] in ("lost", "first") and
                    str(s.get("fix") or "").startswith("hub mcp login ") else {})}
             for n, s in sorted(res["servers"].items())}
-    st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "servers": rows}
+    st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "auto": st.get("auto", True) is not False,
+                    "servers": rows}
     write_status(st)
     count = lambda *states: sum(r["state"] in states for r in rows.values())
     first = count("first")
-    head = tr("status_first" if first else "status", ok=count("ok"), bad=count("lost"), later=count("later", "failed"),
-              first=first)
+    head = tr("status_first" if first else "status", ok=count("ok"), bad=count("lost"), first=first)
     if head == st.get("posted"):
         return False
     put("ext.post", {"plugin": NAME, "text": head})
@@ -1330,9 +1419,13 @@ def login_start(server, hub_st, now, run=None):
     return {"state": "wait", "at": now}
 
 
+CLICK = re.compile(r"(login|reconnect) (\S{1,128})|auto (on|off)")
+
+
 def clicks(hub_st, after, now):
-    """[(seq, server)] - the owner's "login <server>" posts of the plugin channel after seq `after`, not older than
-    LOGIN_FRESH; the second item is the highest seq seen. Only the owner's word counts (a session posts there too)."""
+    """[(seq, act, arg)] - the owner's posts of the plugin channel after seq `after`, not older than LOGIN_FRESH:
+    "login <server>", "reconnect <server>", "auto on|off"; the second item is the highest seq seen. Only the owner's
+    word counts (a session posts there too)."""
     out, top = [], after
     for p in hub_st.get("feeds", {}).get(NAME) or []:
         try:
@@ -1342,9 +1435,9 @@ def clicks(hub_st, after, now):
         if seq <= after:
             continue
         top = max(top, seq)
-        m = re.fullmatch(r"login (\S{1,128})", str(p.get("text") or "").strip())
+        m = CLICK.fullmatch(str(p.get("text") or "").strip())
         if p.get("by") == "owner" and m and now - float(p.get("ts") or 0) <= LOGIN_FRESH:
-            out.append((seq, m.group(1)))
+            out.append((seq, "auto", m.group(3)) if m.group(3) else (seq, m.group(1), m.group(2)))
     return out, top
 
 
@@ -1373,8 +1466,27 @@ def login_step(now=None, run=None, hub_st=None):
     if top != data.get("seen"):
         data["seen"] = top
         changed = True
-    can = {n for n, r in ((load_state().get("status") or {}).get("servers") or {}).items() if r.get("can_login")}
-    for _, server in found:
+    known = (load_state().get("status") or {}).get("servers") or {}
+    can = {n for n, r in known.items() if r.get("can_login")}
+    checks = []
+    for _, act, server in found:
+        if act == "auto":
+            st = load_state()
+            st["auto"] = server == "on"
+            save_state(st)
+            print(time.strftime("%H:%M:%S"), "mcp-keeper: auto reconnect", server, flush=True)
+            changed = True
+            continue
+        if act == "reconnect":
+            if server not in known:
+                rows[server] = {"state": "fail", "act": "reconnect", "at": now, "why": tr("reconnect_unknown")}
+            elif (rows.get(server) or {}).get("state") != "wait":
+                put("mcp.reconnect", {"server": server})
+                print(time.strftime("%H:%M:%S"), "mcp-keeper: reconnect", server, "(view)", flush=True)
+                rows[server] = {"state": "sent", "act": "reconnect", "at": now}
+                checks.append(server)
+            changed = True
+            continue
         if (rows.get(server) or {}).get("state") == "wait":
             continue   # one is open already: the click does not start a second
         if server not in can:
@@ -1387,7 +1499,48 @@ def login_step(now=None, run=None, hub_st=None):
     if changed:
         write_json(login_path(), data)
         write_status(load_state())
+    for server in checks:   # after the row "sent" is written: the check writes its result over it
+        after_reconnect(server)
     return changed
+
+
+def after_reconnect(server):
+    """The sessions took the reconnect in: this one server is checked again (an unclear answer is asked again), its row
+    of the view and of the login file say what came out."""
+    if RECHECK_ASYNC:
+        threading.Thread(target=recheck, args=(server,), daemon=True).start()
+    else:
+        recheck(server)
+
+
+def recheck(server):
+    try:
+        time.sleep(RECONNECT_WAIT)
+        with LOCK:
+            conf, st, hub_st = settings(), load_state(), hub_state()
+            hub, now = hub_session(hub_st), time.time()
+            res = settle(checkup(conf, now, st, hub, hub_st, only={server}), conf, now, st, hub, hub_st)
+            s = res["servers"].get(server)
+            rows = ((st.get("status") or {}).get("servers") or {})
+            if s and server in rows:
+                if s["state"] == "ok":
+                    st.setdefault("ok_at", {})[server] = now
+                rows[server] = {"state": s["state"], "ok_at": st.get("ok_at", {}).get(server),
+                                **({"why": s["why"]} if s.get("why") else {}), **({"by": s["by"]} if s.get("by") else {}),
+                                **({"can_login": True} if s["state"] in ("lost", "first") and
+                                   str(s.get("fix") or "").startswith("hub mcp login ") else {})}
+            st["auto"] = load_state().get("auto", st.get("auto", True))
+            save_state(st)
+            data = read_json(login_path()) or {}
+            data.setdefault("rows", {})[server] = {"state": "done" if s and s["state"] == "ok" else "fail",
+                                                   "act": "reconnect", "at": time.time(),
+                                                   **({"why": s["why"]} if s and s.get("why") else {})}
+            write_json(login_path(), data)
+            write_status(st)
+            print(time.strftime("%H:%M:%S"), "mcp-keeper: after reconnect", server, "-", s["state"] if s else "-",
+                  flush=True)
+    except Exception as e:   # noqa: BLE001 - a click must not take the process down
+        print(time.strftime("%H:%M:%S"), "mcp-keeper: reconnect:", type(e).__name__, flush=True)
 
 
 def login_watch():
@@ -1400,6 +1553,11 @@ def login_watch():
 
 
 def once(now=None):
+    with LOCK:
+        return one_pass(now)
+
+
+def one_pass(now=None):
     conf = settings()
     st = load_state()
     hub_st = hub_state()
@@ -1411,6 +1569,7 @@ def once(now=None):
         save_state(st)
         put(f"ext.{NAME}.checked", {"later": True, "why": res.get("why")})
         return res
+    settle(res, conf, now, st, hub, hub_st)
     servers = res["servers"]
     ok_at = st.setdefault("ok_at", {})
     for n, s in servers.items():
@@ -1419,10 +1578,13 @@ def once(now=None):
     # a login counts as "had" only on a live server: a record erased later is then told as erased
     st["had"] = sorted(set(st.get("had") or []) | {n for n in res["logged"] if servers.get(n, {}).get("state") == "ok"})
     res["dups"] = duplicates() if conf["check_duplicates"] else []
-    bad = lost(res)
+    bad = {n: s for n, s in lost(res).items() if not s.get("unclear")}   # an alarm rests only on a clear answer
+    st["auto"] = load_state().get("auto", st.get("auto", True))   # the owner may have switched it during the pass
+    if st["auto"]:
+        res["reconnected"] = auto_step(st, sorted(lost(res)), now, conf)
     put(f"ext.{NAME}.checked", {"ok": sorted(n for n, s in servers.items() if s["state"] == "ok"),
                                 "lost": [{"name": n, "why": s.get("why")} for n, s in sorted(bad.items())],
-                                "later": sorted(n for n, s in servers.items() if s["state"] in ("later", "failed")),
+                                "unclear": sorted(n for n, s in servers.items() if s.get("unclear")),
                                 "skip": sorted(n for n, s in servers.items() if s["state"] == "skip"),
                                 "dups": res["dups"]})
     post_status(st, res, conf, now)
@@ -1471,10 +1633,10 @@ def once(now=None):
 def ladder(st, servers, bad, conf, now, hub_st, res):
     """cover: a lost login goes to the Hub Developer at once (what is seen, the holder, the fix; again not within a day),
     to the owner only after `owner_after` more passes still see it lost, never one auth-keeper holds (it tells the owner
-    itself). A pass that cannot tell (later) neither counts nor resets. Returns the servers for the owner's alarm."""
+    itself). A pass that cannot tell (unclear) neither counts nor resets. Returns the servers for the owner's alarm."""
     streak, warned = st.setdefault("streak", {}), st.setdefault("dev_warned", {})
     for n in list(streak):
-        if n not in bad and (servers.get(n) or {}).get("state") != "later":
+        if n not in bad and not (servers.get(n) or {}).get("unclear"):
             del streak[n]
     for n in list(warned):
         if (servers.get(n) or {}).get("state") in (None, "ok", "skip", "first"):
@@ -1518,13 +1680,25 @@ def tell_sessions(names, use, st, now):
     return sent
 
 
+def start_auto():
+    """At start: what the last pass left lost reconnects in the live sessions now (not after START_DELAY)."""
+    st = load_state()
+    if st.get("auto", True) is False:
+        return
+    rows = (st.get("status") or {}).get("servers") or {}
+    with LOCK:
+        if auto_step(st, sorted(n for n, r in rows.items() if r.get("state") == "lost"), time.time(), settings()):
+            save_state(st)
+
+
 def report(res):
     s = res.get("servers") or {}
     pick = lambda state: ", ".join(n for n, x in sorted(s.items()) if x["state"] == state) or "-"
     if res.get("later_all"):
         print(time.strftime("%H:%M:%S"), "mcp-keeper: later -", res.get("why"), flush=True)
         return
-    print(time.strftime("%H:%M:%S"), "mcp-keeper: live:", pick("ok"), "| lost:", pick("lost"), "| later:", pick("later"),
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: live:", pick("ok"), "| lost:", pick("lost"), "| unclear:",
+          ", ".join(n for n, x in sorted(s.items()) if x.get("unclear")) or "-",
           "| first:", pick("first"), "| skip:", pick("skip"),
           "| duplicates:", ", ".join(d["name"] for d in res.get("dups") or []) or "-", flush=True)
 
@@ -1532,7 +1706,8 @@ def report(res):
 def loop():
     start_clean()
     write_status(load_state())   # the view has its data right after a market update replaced the folder
-    threading.Thread(target=login_watch, daemon=True).start()   # the view's "Log in" button
+    threading.Thread(target=login_watch, daemon=True).start()   # the view's "Log in" / "Reconnect" buttons
+    start_auto()
     if time.time() - float(load_state().get("at") or 0) >= AGAIN_AFTER:
         time.sleep(START_DELAY)
         report(once())

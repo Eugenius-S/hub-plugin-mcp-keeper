@@ -125,11 +125,23 @@ output, command lines, free-form status rows) are removed or rewritten at start.
 
 The view "MCP logins" shows every server, its state and when it was last live (`status.json` next to the plugin).
 
-A row of a server that needs a login (never logged in, login lost) has a **Log in** / **Reconnect** button. It posts
-`login <server>` to the plugin channel; the process runs the same `hub mcp login <session> <server>` you would type in a
-terminal (a live session that has the server, else the hub's own) and your browser opens the login. The row says "login
-opened in the browser" until the hub reports the end, then the result (done, or why not); a login that went through
-makes the next check start at once. Only your own post counts, only for a server whose row has the button.
+A row says only **live** or **lost** (with the reason). When a pass gets no clear answer (a timeout, no network to the
+server), it asks again up to 3 times with a pause, reconnecting the server in the sessions in between; still no answer -
+the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward one).
+
+Each row has two buttons:
+
+- **Reconnect** - no login: posts `reconnect <server>`; the hub reconnects the server in every live session that has it
+  (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the server again at once and
+  the row shows the result.
+- **Log in again** - only for a server that logs in in a browser: posts `login <server>`; the process runs the same
+  `hub mcp login <session> <server>` you would type in a terminal (a live session that has the server, else the hub's
+  own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the end, then
+  the result (done, or why not); a login that went through makes the next check start at once.
+
+The box **Reconnect automatically** under the table (on by default; your choice is kept in `state.json`): at the start
+and on every pass a server that is not live is reconnected, at most once in 10 minutes per server, with a line in the
+log. A one-time login (`one_time`) is never reconnected. Only your own posts count, only for a server in the table.
 
 Run one pass by hand: `PYTHONPATH=<hub code> python3 main.py --once`.
 

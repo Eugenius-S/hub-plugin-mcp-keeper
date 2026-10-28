@@ -16,6 +16,7 @@ import main  # noqa: E402
 
 REAL_GET, REAL_PROCESSES, REAL_SLEEP = getattr(main, "mcp_get", None), main.processes, time.sleep   # before any patch
 REAL_PROBE = main.probe
+REAL_CURL = main.curl_status
 
 NOW = 2_000_000_000.0
 
@@ -55,6 +56,8 @@ class Base(unittest.TestCase):
             mock.patch.object(main, "mono", lambda: self.clock),
             mock.patch.object(main, "drift", lambda: 0.0),
             mock.patch.object(main, "hub_state", lambda: self.hub),
+            mock.patch.object(main, "curl_status", lambda *a: None),
+            mock.patch.object(main, "RECHECK_ASYNC", False),
         ]
         for p in patches:
             p.start()
@@ -107,6 +110,12 @@ class Base(unittest.TestCase):
 
     def dev(self):
         return [d for t, d in self.facts if t == "message.received" and d["to"] == "hub-dev"]
+
+    def assertUnclear(self, row, msg=None):
+        """No clear answer after the retries: the view says lost with the reason, nobody is alarmed for it."""
+        self.assertEqual(row["state"], "lost", msg)
+        self.assertTrue(row.get("unclear"), msg)
+        self.assertIn("no clear answer after", row["why"], msg)
 
     def run_once(self, now=NOW):
         self.facts.clear()
@@ -189,7 +198,7 @@ class Pass(Base):
         self.assertEqual({s["state"] for s in res["servers"].values()}, {"ok"})
         self.assertEqual(self.notes(), [])
         posts = [d for t, d in self.facts if t == "ext.post"]
-        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 live, 0 lost, 0 later"}])   # a human line only
+        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 live, 0 lost"}])   # a human line only
         with open(os.environ["MCP_KEEPER_STATUS"], encoding="utf-8") as f:
             self.assertEqual(json.load(f)["servers"]["canva"]["state"], "ok")   # the view's data - the file
         self.run_once(NOW + 900)
@@ -211,7 +220,7 @@ class Pass(Base):
     def test_network_doubt_is_not_lost(self):
         self.probes[URLS["figma"]] = (None, None)
         res = self.run_once()
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
         self.assertEqual(self.notes(), [])
 
     def test_expired_access_asks_claude_about_this_server_only(self):
@@ -252,7 +261,7 @@ class Pass(Base):
         n = len(self.asked)
         res = self.run_once(NOW + 900)
         self.assertEqual(len(self.asked), n, "no second run within the hour")
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
         self.run_once(NOW + 3700)
         self.assertGreater(len(self.asked), n)
 
@@ -260,14 +269,14 @@ class Pass(Base):
         self.expire("canva")
         res = self.run_once()
         self.assertNotIn("canva", self.asked)
-        self.assertEqual(res["servers"]["canva"]["state"], "later")
+        self.assertUnclear(res["servers"]["canva"])
 
     def test_ask_claude_off(self):
         self.config({}, {"ask_claude": False})
         self.expire("figma")
         res = self.run_once()
         self.assertEqual(self.asked, [])
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
 
     def test_expired_without_refresh_is_lost(self):
         self.live(figma={"refreshToken": None, "expiresAt": (NOW - 60) * 1000})
@@ -436,6 +445,9 @@ class Secrets(Base):
               "Bearer " + self.SECRET + "'\n"
               "  102 Mon Oct 26 10:00:01 2026 npx -y mcp-remote https://mcp.canva.com/mcp?key=" + self.SECRET + "\n"
               "  103 Mon Oct 26 10:00:02 2026 /bin/zsh -l\n")
+        if os.name == "nt":   # Windows: the same processes as PowerShell's JSON
+            ps = json.dumps([{"ProcessId": int(l.split()[0]), "CreationDate": "2026-10-26",
+                              "CommandLine": l.split(" 2026 ", 1)[1]} for l in ps.splitlines()])
         done = subprocess.CompletedProcess([], 0, stdout=ps.encode(), stderr=b"")
         with mock.patch.object(main.subprocess, "run", lambda *a, **k: done):
             rows = REAL_PROCESSES("canva")
@@ -505,7 +517,12 @@ class Token(Base):
     """The access token goes only to https (http - only to this machine) and is never carried through a redirect."""
 
     def serve(self, handler):
-        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        class Read(handler):
+            # read the body first: on Windows a socket closed with unread data sends a reset, the client sees no answer
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                handler.do_POST(self)
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Read)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
@@ -594,14 +611,14 @@ class Unknown(Base):
         self.expire("figma")
         self.gets["figma"] = 'No MCP server named "figma". Configured servers: github'
         res = self.run_once()
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
         self.assertEqual(self.notes(), [])
 
     def test_a_name_of_another_server_is_no_answer(self):
         self.expire("figma")
         self.gets["figma"] = "figma:\n  Status: \u2713 Connected\n  Type: http\n  URL: https://elsewhere.example.com/mcp\n"
         res = self.run_once()
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
 
     def test_same_address_answer_counts(self):
         self.expire("figma")
@@ -612,7 +629,7 @@ class Unknown(Base):
         self.expire("figma")
         self.gets["figma"] = "No MCP server named figma"
         res = self.run_once(NOW + 3 * 86400)
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
         self.assertIn("3 days", res["servers"]["figma"]["why"])
         self.assertEqual(self.notes(), [])
         self.assertIn("days ago", read(os.environ["MCP_KEEPER_STATUS"])["servers"]["figma"]["why"])
@@ -621,7 +638,7 @@ class Unknown(Base):
         self.config({}, {"stale_days": 0})
         self.expire("figma")
         self.gets["figma"] = "No MCP server named figma"
-        self.assertNotIn("why", self.run_once(NOW + 9 * 86400)["servers"]["figma"])
+        self.assertNotIn("days", self.run_once(NOW + 9 * 86400)["servers"]["figma"]["why"])
 
 
 class Refresh(Base):
@@ -657,7 +674,7 @@ class Refresh(Base):
         Unknown.expire.__get__(self)("canva")
         res = self.run_once()
         self.assertNotIn("canva", self.asked)
-        self.assertEqual(res["servers"]["canva"]["state"], "later")
+        self.assertUnclear(res["servers"]["canva"])
 
     def lock(self, age):
         path = os.path.join(TMP, "claude", "mcp-refresh-abc123.lock")
@@ -671,7 +688,7 @@ class Refresh(Base):
         self.lock(10)
         res = self.run_once()
         self.assertEqual(self.asked, [])
-        self.assertEqual(res["servers"]["figma"]["state"], "later")
+        self.assertUnclear(res["servers"]["figma"])
 
     def test_old_lock_does_not_hold(self):
         Unknown.expire.__get__(self)("figma")
@@ -722,7 +739,8 @@ class Net(Base):
         with mock.patch.object(main.time, "sleep", sleep), mock.patch.object(main.time, "time", lambda: wall[0]), \
                 mock.patch.object(main, "net_up", lambda: net.append(1) or True), mock.patch.object(main, "once", once), \
                 mock.patch.object(main, "start_clean", lambda: None), mock.patch.object(main, "write_status", lambda s: None), \
-                mock.patch.object(main, "load_state", lambda: {"at": wall[0]}), mock.patch.object(main, "report", lambda r: None):
+                mock.patch.object(main, "load_state", lambda: {"at": wall[0]}), mock.patch.object(main, "report", lambda r: None),                 mock.patch.object(main, "login_watch", lambda: None), mock.patch.object(main, "start_auto", lambda: None):
+            # a real login_watch thread outlives the test and writes login.json under the next ones (Windows: flaky)
             with self.assertRaises(Stop):
                 main.loop()
         self.assertEqual(len(net), 6, "two rounds of 15 minutes: 6 TCP checks, not 60")
@@ -799,7 +817,7 @@ class SessionWord(Base):
     def test_a_parked_session_is_no_word(self):
         self.expire("canva")
         self.hub["sessions"]["worker"]["info"]["mcp"] = []
-        self.assertEqual(self.run_once()["servers"]["canva"]["state"], "later")   # only sleepy (parked) has it
+        self.assertUnclear(self.run_once()["servers"]["canva"])   # only sleepy (parked) has it
 
     def test_connected_does_not_override_a_real_later(self):
         self.expire("figma")
@@ -888,11 +906,11 @@ class Headers(Base):
     def test_helper_timeout_or_no_start_is_later(self):
         for out in [(124, ""), None]:
             self.helper = out
-            self.assertEqual(self.run_once()["servers"]["buffer"]["state"], "later", out)
+            self.assertUnclear(self.run_once()["servers"]["buffer"], out)
 
     def test_server_down_is_later(self):
         self.probes["https://i/mcp"] = (None, None)
-        self.assertEqual(self.run_once()["servers"]["icons"]["state"], "later")
+        self.assertUnclear(self.run_once()["servers"]["icons"])
 
     def test_header_values_are_never_stored(self):
         os.environ["KEEPER_TEST_KEY"] = "env-secret"
@@ -1074,7 +1092,7 @@ class Cover(Base):
         self.run_once()
         self.run_once(NOW + 900)
         self.probes["https://gate.example/mcp"] = (None, None)
-        self.assertEqual(self.run_once(NOW + 1800)["servers"]["gate"]["state"], "later")
+        self.assertUnclear(self.run_once(NOW + 1800)["servers"]["gate"])
         self.probes["https://gate.example/mcp"] = (False, 401)
         self.run_once(NOW + 2700)
         self.assertEqual(len(self.notes()), 1)
@@ -1254,6 +1272,189 @@ class Icon(unittest.TestCase):
         with open(os.path.join(ROOT, "main.js"), encoding="utf-8") as f:
             self.assertIn('icon: "icon.svg"', f.read())
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "icon.png")))
+
+
+class Unclear(Base):
+    """0.6.0, owner 28.10: the view says only live or lost. What the pass cannot judge is asked again with a pause,
+    reconnected in the sessions in between; still no answer - lost with the reason, no alarm."""
+
+    def reconnects(self):
+        return [d["server"] for t, d in self.facts if t == "mcp.reconnect"]
+
+    def test_no_later_reaches_the_view(self):
+        self.probes[URLS["figma"]] = (None, None)
+        self.run_once()
+        got = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertNotIn("later", json.dumps(got))
+        self.assertEqual(got["servers"]["figma"]["state"], "lost")
+        self.assertIn("no clear answer after 4", got["servers"]["figma"]["why"])
+        self.assertTrue(got["auto"])
+
+    def test_retries_then_lost_without_an_alarm(self):
+        self.probes[URLS["figma"]] = (None, None)
+        res = self.run_once()
+        self.assertUnclear(res["servers"]["figma"])
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+        self.assertEqual(self.reconnects(), ["figma"], "auto: once per pass, before the retries")
+
+    def test_an_answer_on_a_retry_is_taken(self):
+        calls = []
+
+        def flaky(ent):
+            calls.append(ent.get("serverUrl"))
+            if ent.get("serverUrl") == URLS["figma"] and calls.count(URLS["figma"]) == 1:
+                return None, None
+            return True, 200
+        with mock.patch.object(main, "probe", flaky):
+            res = self.run_once()
+        self.assertEqual(res["servers"]["figma"]["state"], "ok")
+        self.assertEqual(calls.count(URLS["figma"]), 2)
+
+    def test_an_old_later_in_the_status_file_becomes_lost(self):
+        got = main.clean_status({"at": 1, "servers": {"figma": {"state": "later", "why": "timeout"}}})
+        self.assertEqual(got["servers"]["figma"]["state"], "lost")
+        self.assertIn("timeout", got["servers"]["figma"]["why"])
+
+    def test_one_time_login_is_never_reconnected(self):
+        self.probes[URLS["canva"]] = (None, None)
+        self.run_once()
+        self.assertEqual(self.reconnects(), [])
+
+    def test_auto_off_does_not_reconnect(self):
+        st = main.load_state()
+        st["auto"] = False
+        main.save_state(st)
+        self.probes[URLS["figma"]] = (None, None)
+        res = self.run_once()
+        self.assertUnclear(res["servers"]["figma"])
+        self.assertEqual(self.reconnects(), [])
+        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
+
+    def test_auto_reconnect_not_more_often_than_ten_minutes(self):
+        self.probes[URLS["figma"]] = (None, None)
+        self.run_once(NOW)
+        self.run_once(NOW + 300)
+        self.assertEqual(self.reconnects(), [])
+        self.run_once(NOW + main.AUTO_EVERY + 1)
+        self.assertEqual(self.reconnects(), ["figma"])
+
+    def test_a_lost_server_reconnects_at_start(self):
+        self.reject("figma", "canva")
+        self.run_once()
+        self.assertEqual(self.reconnects(), ["figma"], "a pass reconnects what is lost")
+        st = main.load_state()
+        st["reconnected"] = {}
+        main.save_state(st)
+        self.facts.clear()
+        main.start_auto()
+        self.assertEqual(self.reconnects(), ["figma"], "canva: a one-time login is not touched")
+        self.facts.clear()
+        st = main.load_state()
+        st["auto"], st["reconnected"] = False, {}
+        main.save_state(st)
+        main.start_auto()
+        self.assertEqual(self.reconnects(), [])
+
+
+class Curl(Base):
+    """Python on Windows may not trust the proxy's certificate while curl does: the third try is curl. The login
+    headers go to curl in its config on stdin, never in the command line."""
+
+    def test_headers_go_on_stdin_not_in_argv(self):
+        seen = {}
+
+        def run(cmd, **kw):
+            seen["cmd"], seen["input"] = cmd, kw.get("input")
+            return subprocess.CompletedProcess(cmd, 0, "401", "")
+        with mock.patch.object(main.shutil, "which", lambda n: "/bin/curl"), \
+                mock.patch.object(main.subprocess, "run", run), mock.patch.object(main, "curl_status", REAL_CURL):
+            self.assertEqual(main.curl_status("https://x.example/mcp", {"Authorization": "Bearer secret"}, b"{}"), 401)
+        self.assertEqual(seen["cmd"], ["/bin/curl", "-K", "-"])
+        self.assertNotIn("secret", " ".join(seen["cmd"]))
+        self.assertIn('header = "Authorization: Bearer secret"', seen["input"])
+        self.assertIn("max-redirs = 0", seen["input"])
+
+    def test_no_curl_is_no_answer(self):
+        with mock.patch.object(main.shutil, "which", lambda n: None), mock.patch.object(main, "curl_status", REAL_CURL):
+            self.assertIsNone(main.curl_status("https://x.example/mcp", {}, b"{}"))
+
+    def test_probe_falls_back_to_curl_when_urllib_cannot_connect(self):
+        class Opener:
+            def open(self, *a, **kw):
+                raise OSError("certificate has expired")
+        for code, want in ((401, (False, 401)), (200, (True, 200)), (None, (None, None))):
+            with mock.patch.object(main.urllib.request, "build_opener", lambda *a: Opener()), \
+                    mock.patch.object(main, "curl_status", lambda *a, c=code: c):
+                self.assertEqual(main.probe_with("https://x.example/mcp", {"Authorization": "Bearer t"}), want)
+
+
+class ViewReconnect(Base):
+    """The view's "Reconnect" button and the "Reconnect automatically" box: the owner's posts "reconnect <server>" and
+    "auto on|off" in the plugin channel."""
+
+    def setUp(self):
+        super().setUp()
+        self.reject("figma")
+        self.run_once()
+        self.facts.clear()
+        self.hub["feeds"] = {main.NAME: []}
+
+    def post(self, seq, text, by="owner"):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text, "ts": NOW})
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def test_reconnect_sends_the_fact_and_checks_the_server_again(self):
+        self.accept("figma")
+        self.post(1, "reconnect figma")
+        self.assertTrue(main.login_step(NOW + 1))
+        self.assertIn(("mcp.reconnect", {"server": "figma"}), self.facts)
+        row = self.rows()["figma"]
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual((row["login"]["state"], row["login"]["act"]), ("done", "reconnect"))
+
+    def test_reconnect_that_did_not_help_says_so(self):
+        self.post(1, "reconnect figma")
+        main.login_step(NOW + 1)
+        row = self.rows()["figma"]
+        self.assertEqual((row["state"], row["login"]["state"], row["login"]["act"]), ("lost", "fail", "reconnect"))
+
+    def test_only_the_owner_and_only_a_known_server(self):
+        self.post(1, "reconnect figma", by="worker")
+        self.post(2, "auto off", by="worker")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.facts, [])
+        self.assertTrue(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
+        self.post(3, "reconnect nosuch")
+        main.login_step(NOW + 2)
+        self.assertEqual(self.facts, [])
+        self.assertNotIn("nosuch", self.rows())
+
+    def test_auto_box_is_kept(self):
+        self.post(1, "auto off")
+        main.login_step(NOW + 1)
+        self.assertFalse(main.load_state()["auto"])
+        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
+        self.run_once(NOW + 100)
+        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"], "a pass keeps the owner's choice")
+        self.post(2, "auto on")
+        main.login_step(NOW + 101)
+        self.assertTrue(main.load_state()["auto"])
+
+
+class JsStrings(unittest.TestCase):
+    def test_view_keys_match_and_cyrillic_only_in_ru(self):
+        import re
+        with open(os.path.join(ROOT, "main.js"), encoding="utf-8") as f:
+            src = f.read()
+        en, ru = src.index("  en: {"), src.index("  ru: {")
+        end = src.index("\n};", ru)
+        keys = lambda part: set(re.findall(r"(\w+): \"", part))
+        self.assertEqual(keys(src[en:ru]), keys(src[ru:end]))
+        self.assertTrue({"reconnect", "auto", "relogin"} <= keys(src[en:ru]))
+        self.assertNotIn("later", keys(src[en:ru]))
+        self.assertFalse(re.search("[а-яА-ЯёЁ]", src[:ru] + src[end:]))
 
 
 class Strings(unittest.TestCase):
