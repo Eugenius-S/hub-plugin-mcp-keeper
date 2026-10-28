@@ -147,7 +147,7 @@ Buttons of a row:
 - **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the hub reconnects the server in every running
   session that has it (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the
   server again at once and the row shows the result.
-- **Log in** / **Log in again** - only for a server that logs in in a browser: posts `login <server>`; the process runs
+- **Log in** / **Log in again** - only for a lost server or one nobody logged in yet (an active one has only "Connect another account"), and only for a server that logs in in a browser: posts `login <server>`; the process runs
   the same `hub mcp login <session> <server>` you would type in a terminal (a running session that has the server, else
   the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
   end, then the result (done, or why not); a login that went through makes the next check start at once.
@@ -171,7 +171,7 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 У активного сервера со своим входом кнопка **Подключить другой**: плагин открывает терминал с `claude` в папке входа
 этого сервера и подсказкой (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой аккаунт в браузере).
 Сам плагин активный вход не переключает: хранилище входов Claude Code ему писать нельзя, а `claude mcp logout` стирает
-вход. У отвалившегося сервера кнопки **Переподключить** и **Войти**. Подробнее выше, в разделе про вид.
+вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у активного только **Подключить другой**. Подробнее выше, в разделе про вид.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 

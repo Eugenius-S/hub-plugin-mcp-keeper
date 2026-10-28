@@ -1589,10 +1589,72 @@ class AllServers(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.7.0")
+        self.assertEqual(m["version"], "0.7.1")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
+
+
+VIEW_BUTTONS = """
+import { pathToFileURL } from "node:url";
+const rows = JSON.parse(process.argv[2]);
+const node = (tag, cls = "", text = "") => {
+  const n = { tag, cls, text, kids: [], style: {}, firstChild: null };
+  n.append = (...k) => { n.kids.push(...k); n.firstChild = n.kids[0] || null; };
+  n.replaceChildren = (...k) => { n.kids = []; n.firstChild = null; n.append(...k); };
+  return n;
+};
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ v: 1, at: 1, every: 15, auto: true, servers: rows }) });
+const view = {};
+const mod = await import(pathToFileURL(process.argv[1]).href);
+mod.default({ lang: "en", el: node, postFeed() {}, addView: (v) => Object.assign(view, v) });
+const root = node("div");
+view.render(root, {});
+await new Promise((r) => setTimeout(r, 50));
+const out = {};
+const walk = (n, row) => {
+  if (n.tag === "tr" && n.kids[0] && n.kids[0].tag === "td") row = n.kids[0].text;
+  if (n.tag === "button") (out[row] = out[row] || []).push(n.cls.replace("btn ", ""));
+  n.kids.forEach((k) => k && k.tag && walk(k, row));
+};
+walk(root, "");
+console.log(JSON.stringify(out));
+"""
+
+
+class ViewButtons(unittest.TestCase):
+    """0.7.1: an active server has only "Connect another account"; "Log in" stays for a lost one and a never-logged-in one.
+    The page is run in node with a stub hub (no browser)."""
+
+    def buttons(self, rows):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("no node")
+        got = subprocess.run([node, "--input-type=module", "-e", VIEW_BUTTONS, os.path.join(ROOT, "main.js"), json.dumps(rows)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        return json.loads(got.stdout)
+
+    def test_an_active_server_has_only_connect_another_and_a_lost_one_keeps_login(self):
+        rows = {"figma": {"state": "ok", "title": "Figma", "can_login": True, "can_switch": True},
+                "buffer": {"state": "lost", "title": "Buffer", "can_login": True},
+                "mobbin": {"state": "first", "title": "Mobbin", "can_login": True}}
+        got = self.buttons(rows)
+        self.assertEqual(got["Figma"], ["mk-switch"])
+        self.assertEqual(got["Buffer"], ["mk-reconnect", "mk-login"])
+        self.assertEqual(got["Mobbin"], ["mk-reconnect", "mk-login"])
+
+    def test_an_active_server_without_a_login_of_its_own_has_no_buttons(self):
+        got = self.buttons({"canva": {"state": "ok", "title": "Canva", "can_login": True}})
+        self.assertEqual(got, {})
+
+    def test_the_process_never_gives_an_active_row_a_login(self):
+        got = main.clean_status({"servers": {"a": {"state": "ok", "can_login": True, "can_switch": True},
+                                              "b": {"state": "lost", "can_login": True}}})["servers"]
+        self.assertNotIn("can_login", got["a"])
+        self.assertTrue(got["a"]["can_switch"])
+        self.assertTrue(got["b"]["can_login"])
 
 
 class JsStrings(unittest.TestCase):

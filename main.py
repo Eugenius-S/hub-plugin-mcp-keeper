@@ -1331,7 +1331,7 @@ def clean_status(data):
             rows[str(n)] = {"state": "lost" if r["state"] in ("later", "failed") else r["state"], "title": title,
                             **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
                             **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {}),
-                            **({"can_login": True} if r.get("can_login") is True else {}),
+                            **({"can_login": True} if r.get("can_login") is True and r["state"] != "ok" else {}),
                             **({"can_switch": True} if r.get("can_switch") is True else {}),
                             **({"ignored": True} if r.get("ignored") is True else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY,

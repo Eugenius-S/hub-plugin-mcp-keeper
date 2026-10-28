@@ -118,7 +118,7 @@ function actionCell(row, name, s) {
   bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
   if (s.can_switch) bar.append(button("mk-switch", "switch", "switch_sent", name, "switch", td));
   else if (s.state !== "skip" && s.state !== "ok") bar.append(button("mk-reconnect", "reconnect", "reconnect_sent", name, "reconnect", td));
-  if (s.can_login) bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
+  if (s.can_login && s.state !== "ok") bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
   if (bar.firstChild) td.append(bar);
 }
 
@@ -165,7 +165,7 @@ function draw(root) {
     th.style.cssText = "text-align:left;padding:6px 8px;opacity:.7;font-weight:500";
     head.append(th);
   }
-  const acts = (s) => s.can_switch || s.can_login || s.login || (s.state !== "skip" && s.state !== "ok");
+  const acts = (s) => s.can_switch || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
   const withActs = shown.some(([, s]) => acts(s));
   if (withActs) head.append(hub.el("th"));
   table.append(head);
