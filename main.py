@@ -76,6 +76,7 @@ LOGIN_FRESH = 600         # a click older than this is not run (the process was 
 LOGIN_LIVE = 360          # a login that waits longer has ended (the hub waits 300 s for the owner)
 LOGIN_RUN = 75            # the `hub mcp login` command itself (it returns once the link is open) - limit, seconds
 LOGIN_SHOW = 3600         # a finished login stays in the row this long
+SWITCH_SHOW = 300         # "terminal opened" stays in the row this long
 TRIES = 3
 RETRIES = 3               # a server the pass could not judge is asked again this many times before it shows as lost
 RETRY_PAUSE = 20          # seconds between those tries (sessions reconnect it in between, when auto is on)
@@ -111,8 +112,15 @@ STR = {
         "why_expired": "the token without refresh has expired",
         "to_session": "MCP {server}: the login is lost, the owner is told. Its tools fail until then - do not repeat "
                       "the calls in a loop; work without it or wait, the hub reconnects it after the login.",
-        "status": "MCP: {ok} live, {bad} lost",
-        "status_first": "MCP: {ok} live, {bad} lost, {first} never logged in",
+        "status": "MCP: {ok} active, {bad} lost",
+        "status_first": "MCP: {ok} active, {bad} lost, {first} never logged in",
+        "why_no_word": "no word from the running sessions yet",
+        "why_no_word_program": "a program, not started here: no word from the running sessions yet",
+        "switch_unknown": "no other account can be connected to this server from here",
+        "switch_noclaude": "Claude Code was not found",
+        "switch_failed": "the terminal did not open",
+        "switch_hint": "In Claude Code: /mcp, choose {name}, Clear authentication, then Authenticate. "
+                       "In the browser choose the other account.",
         "why_unclear": "no clear answer after {tries} tries",
         "why_first": "never logged in; sessions wait for it",
         "first": "MCP never logged in: {names} - sessions get these servers but nobody has logged in yet (not a lost "
@@ -156,8 +164,15 @@ STR = {
         "why_expired": "токен без refresh истёк",
         "to_session": "MCP {server}: слетел вход, владелец знает. До входа его инструменты не работают — не повторяй "
                       "вызовы по кругу; работай без него или подожди, после входа хаб переподключит сервер.",
-        "status": "MCP: живы {ok}, слетели {bad}",
-        "status_first": "MCP: живы {ok}, слетели {bad}, не входили {first}",
+        "status": "MCP: активны {ok}, слетели {bad}",
+        "status_first": "MCP: активны {ok}, слетели {bad}, не входили {first}",
+        "why_no_word": "работающие сессии пока о нём не говорят",
+        "why_no_word_program": "программа, здесь не запускается: работающие сессии пока о ней не говорят",
+        "switch_unknown": "к этому серверу отсюда другой аккаунт не подключить",
+        "switch_noclaude": "Claude Code не найден",
+        "switch_failed": "терминал не открылся",
+        "switch_hint": "В Claude Code: /mcp, выбери {name}, Clear authentication, затем Authenticate. "
+                       "В браузере выбери другой аккаунт.",
         "why_unclear": "нет ясного ответа после {tries} попыток",
         "why_first": "ни разу не входили, сессии ждут входа",
         "first": "MCP без входа: {names} — сессии получают эти серверы, но в них ещё ни разу не входили (это не слёт). "
@@ -314,6 +329,21 @@ def short(name):
 
 def ignored(name, ignore):
     return str(name).lower() in ignore or short(name) in ignore
+
+
+# how a server is written for a person: the machine name stays the key (commands, status.json), the view shows this
+NAMES = {"icons8mcp": "Icons8", "openai-developer-docs": "OpenAI Docs", "ms365": "MS365", "spytrend": "SpyTrend",
+         "higgsfield-use-after-effects": "Higgsfield After Effects"}
+WORDS = {"github": "GitHub", "ms365": "MS365", "icons8": "Icons8", "openai": "OpenAI", "mcp": "MCP", "ae": "AE"}
+
+
+def human(name):
+    """plugin:<plugin>:<server> -> the server; hyphens -> spaces; a capital letter; known spellings (GitHub, MS365...)."""
+    base = str(name).split(":")[-1].strip()
+    if base.lower() in NAMES:
+        return NAMES[base.lower()]
+    words = [w for w in re.split(r"[-_\s]+", base) if w]
+    return " ".join(WORDS.get(w.lower(), w[:1].upper() + w[1:]) for w in words) or str(name)
 
 
 # ───── commands ─────
@@ -1016,7 +1046,34 @@ def checkup(conf, now, st, hub, hub_st, only=None):
     else:   # 0.3.0 rows: no holder
         for r in out.values():
             r.pop("by", None)
+        rest(conf, out, hub, hub_st, only)
     return {"servers": out, "logged": logged, "later_all": False}
+
+
+def rest(conf, out, hub, hub_st, only=None):
+    """Every server the hub gives to its sessions gets a row (0.7.0): those the passes above do not look at - a program
+    (stdio), a server without a login of its own, one the owner told us to ignore - by the word of the live sessions'
+    Claude Code (connected / needs a login / nothing yet). Nothing is started, nothing is asked of a server here."""
+    given, catalog = hub_servers(), set(catalog_servers())
+    prints = {fingerprint(v) for n, v in catalog_servers().items()}
+    for name in sorted(set(given) | set(served(hub_st))):
+        if name in out or (only is not None and name not in only):
+            continue
+        srv = given.get(name)
+        if str(name).startswith("plugin:") and name not in catalog and srv and fingerprint(srv) in prints:
+            continue   # the core drops the plugin's twin of a catalog server
+        if ignored(name, conf["ignore"]):
+            out[name] = {"state": "skip", "ignored": True}
+            continue
+        word = session_verdict(name, hub_st)
+        program = isinstance(srv, dict) and bool(srv.get("command")) and not remote(srv)
+        if word == "connected":
+            out[name] = {"state": "ok"}
+        elif word == "auth":   # no alarm rests on a word of a session alone: the row says "lost", marked unclear
+            out[name] = {"state": "lost", "why": tr("why_auth"), "unclear": True,
+                         "fix": tr("fix_mcp", name=name) if program else login_fix(name, hub)}
+        else:
+            out[name] = {"state": "skip", "why": tr("why_no_word_program" if program else "why_no_word")}
 
 
 def read_only_row(ent, now, lose):
@@ -1270,9 +1327,13 @@ def clean_status(data):
             why = r.get("why") if isinstance(r.get("why"), str) and len(r["why"]) <= 160 and "://" not in r["why"] else None
             if r["state"] in ("later", "failed"):   # before 0.6.0: the view shows only live or lost
                 why = tr("why_unclear", tries=RETRIES + 1) + ("; " + why if why else "")
-            rows[str(n)] = {"state": "lost" if r["state"] in ("later", "failed") else r["state"], **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
+            title = r.get("title") if isinstance(r.get("title"), str) and 0 < len(r["title"]) <= 60 else human(n)
+            rows[str(n)] = {"state": "lost" if r["state"] in ("later", "failed") else r["state"], "title": title,
+                            **({"ok_at": num(r.get("ok_at"))} if num(r.get("ok_at")) else {}),
                             **({"why": why} if why else {}), **({"by": r["by"]} if r.get("by") in HOLDERS else {}),
-                            **({"can_login": True} if r.get("can_login") is True else {})}
+                            **({"can_login": True} if r.get("can_login") is True else {}),
+                            **({"can_switch": True} if r.get("can_switch") is True else {}),
+                            **({"ignored": True} if r.get("ignored") is True else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY,
             "auto": data.get("auto") is not False, "servers": rows}
 
@@ -1286,10 +1347,11 @@ def write_status(st):
            "servers": {n: dict(r) for n, r in st["status"]["servers"].items()}}
     now = time.time()
     for n, r in ((read_json(login_path()) or {}).get("rows") or {}).items():
-        if n in out["servers"] and isinstance(r, dict) and now - (r.get("at") or 0) < LOGIN_SHOW:
+        shown = SWITCH_SHOW if isinstance(r, dict) and r.get("act") == "switch" else LOGIN_SHOW
+        if n in out["servers"] and isinstance(r, dict) and now - (r.get("at") or 0) < shown:
             why = r.get("why") if isinstance(r.get("why"), str) and "://" not in r["why"] else None
             out["servers"][n]["login"] = {"state": r.get("state"), "at": r.get("at"), **({"why": why[:160]} if why else {}),
-                                          **({"act": "reconnect"} if r.get("act") == "reconnect" else {})}
+                                          **({"act": r["act"]} if r.get("act") in ("reconnect", "switch") else {})}
     write_json(status_path(), out)
 
 
@@ -1322,14 +1384,21 @@ def start_clean():
         write_json(status_path(), old)
 
 
+def view_row(n, s, ok_at, logged=()):
+    """One row of the view: the state, the name for a person (title), what can be pressed. can_switch - a live server
+    with a stored OAuth login: another account can be connected to it (a terminal, see open_terminal)."""
+    return {"state": s["state"], "ok_at": ok_at.get(n), "title": human(n),
+            **({"why": s["why"]} if s.get("why") else {}), **({"by": s["by"]} if s.get("by") else {}),
+            **({"can_login": True} if s["state"] in ("lost", "first") and
+               str(s.get("fix") or "").startswith("hub mcp login ") else {}),
+            **({"can_switch": True} if s["state"] == "ok" and n in logged else {}),
+            **({"ignored": True} if s.get("ignored") else {})}
+
+
 def post_status(st, res, conf, now):
     """Rows for the view (status.json) every pass; one human line to the plugin channel when the picture changed."""
     ok_at = st.setdefault("ok_at", {})
-    rows = {n: {"state": s["state"], "ok_at": ok_at.get(n), **({"why": s["why"]} if s.get("why") else {}),
-                **({"by": s["by"]} if s.get("by") else {}),
-                **({"can_login": True} if s["state"] in ("lost", "first") and
-                   str(s.get("fix") or "").startswith("hub mcp login ") else {})}
-            for n, s in sorted(res["servers"].items())}
+    rows = {n: view_row(n, s, ok_at, res.get("logged") or ()) for n, s in sorted(res["servers"].items())}
     st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "auto": st.get("auto", True) is not False,
                     "servers": rows}
     write_status(st)
@@ -1419,12 +1488,72 @@ def login_start(server, hub_st, now, run=None):
     return {"state": "wait", "at": now}
 
 
-CLICK = re.compile(r"(login|reconnect) (\S{1,128})|auto (on|off)")
+def switch_folder(server, hub_st):
+    """Where the terminal opens: the folder the hub logs this server in from (the same description, so Claude Code finds
+    the server by name there), else the hub's own folder, else the home folder."""
+    try:
+        from core import mcplogin
+        d = mcplogin.login_dir(STATE, login_session(hub_st, server), server)
+        if d and os.path.isdir(d):
+            return d
+    except Exception:   # noqa: BLE001 - no core on the path, no such session
+        pass
+    hub = hub_bin()
+    return os.path.dirname(os.path.dirname(hub)) if hub else os.path.expanduser("~")
+
+
+def launch_terminal(folder, cmd, hint, server):
+    """A terminal window with `claude` in `folder` and the hint above it. A script file, not a command line: the quoting
+    of three shells is not touched. The window is the owner's; it stays open after claude ends."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", server)[:60]
+    os.makedirs(HOME, exist_ok=True)
+    text =re.sub(r"[&|<>^%\"`$\\]", " ", hint)
+    if os.name == "nt":
+        script = os.path.join(HOME, "switch-" + safe + ".cmd")
+        lines = ["@echo off", "chcp 65001 >nul", 'cd /d "' + folder + '"', "echo.", "echo " + text, "echo.",
+                 "call " + subprocess.list2cmdline(cmd), "echo.", "pause"]
+        with open(script, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(lines) + "\n")
+        subprocess.Popen(["cmd.exe", "/c", script], cwd=folder, close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
+        return
+    script = os.path.join(HOME, "switch-" + safe + (".command" if sys.platform == "darwin" else ".sh"))
+    quoted = " ".join("'" + c.replace("'", "'\\''") + "'" for c in cmd)
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\ncd '" + folder.replace("'", "'\\''") + "' || exit 1\necho\necho '" + text.replace("'", " ") +
+                "'\necho\n" + quoted + "\n")
+    os.chmod(script, 0o755)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-a", "Terminal", script], close_fds=True)
+        return
+    term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
+    if not term:
+        raise OSError("no terminal")
+    subprocess.Popen([term, "-e", "sh", script], close_fds=True)
+
+
+def open_terminal(server, hub_st, now, opener=None):
+    """"Connect another account": a live server is not switched by the plugin - the login of Claude Code is not ours to
+    write, and the hub has no command for it. The owner's click opens a terminal with `claude` (/mcp -> the server ->
+    Clear authentication -> Authenticate, in the browser the other account); the row says it. -> the login-file row."""
+    cmd = claude_cmd()
+    if not cmd:
+        return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_noclaude")}
+    hint = tr("switch_hint", name=human(server))
+    try:
+        (opener or launch_terminal)(switch_folder(server, hub_st), cmd, hint, server)
+    except OSError:
+        return {"state": "fail", "act": "switch", "at": now, "why": tr("switch_failed")}
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: terminal for another account:", server, flush=True)
+    return {"state": "done", "act": "switch", "at": now}
+
+
+CLICK = re.compile(r"(login|reconnect|switch) (\S{1,128})|auto (on|off)")
 
 
 def clicks(hub_st, after, now):
     """[(seq, act, arg)] - the owner's posts of the plugin channel after seq `after`, not older than LOGIN_FRESH:
-    "login <server>", "reconnect <server>", "auto on|off"; the second item is the highest seq seen. Only the owner's
+    "login <server>", "reconnect <server>", "switch <server>", "auto on|off"; the second item is the highest seq seen. Only the owner's
     word counts (a session posts there too)."""
     out, top = [], after
     for p in hub_st.get("feeds", {}).get(NAME) or []:
@@ -1441,7 +1570,7 @@ def clicks(hub_st, after, now):
     return out, top
 
 
-def login_step(now=None, run=None, hub_st=None):
+def login_step(now=None, run=None, hub_st=None, opener=None):
     """One look: finish what waits, run what the owner clicked. True - the picture of the view changed."""
     now = now or time.time()
     data = read_json(login_path()) or {}
@@ -1468,6 +1597,7 @@ def login_step(now=None, run=None, hub_st=None):
         changed = True
     known = (load_state().get("status") or {}).get("servers") or {}
     can = {n for n, r in known.items() if r.get("can_login")}
+    switchable = {n for n, r in known.items() if r.get("can_switch")}
     checks = []
     for _, act, server in found:
         if act == "auto":
@@ -1485,6 +1615,13 @@ def login_step(now=None, run=None, hub_st=None):
                 print(time.strftime("%H:%M:%S"), "mcp-keeper: reconnect", server, "(view)", flush=True)
                 rows[server] = {"state": "sent", "act": "reconnect", "at": now}
                 checks.append(server)
+            changed = True
+            continue
+        if act == "switch":
+            if server not in switchable:
+                rows[server] = {"state": "fail", "act": "switch", "at": now, "why": tr("switch_unknown")}
+            else:
+                rows[server] = open_terminal(server, hub_st, now, opener)
             changed = True
             continue
         if (rows.get(server) or {}).get("state") == "wait":
@@ -1525,10 +1662,7 @@ def recheck(server):
             if s and server in rows:
                 if s["state"] == "ok":
                     st.setdefault("ok_at", {})[server] = now
-                rows[server] = {"state": s["state"], "ok_at": st.get("ok_at", {}).get(server),
-                                **({"why": s["why"]} if s.get("why") else {}), **({"by": s["by"]} if s.get("by") else {}),
-                                **({"can_login": True} if s["state"] in ("lost", "first") and
-                                   str(s.get("fix") or "").startswith("hub mcp login ") else {})}
+                rows[server] = view_row(server, s, st.get("ok_at") or {}, res.get("logged") or ())
             st["auto"] = load_state().get("auto", st.get("auto", True))
             save_state(st)
             data = read_json(login_path()) or {}

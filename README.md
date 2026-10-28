@@ -123,29 +123,55 @@ output, command lines, free-form status rows) are removed or rewritten at start.
 | `owner_after_passes` | 2 | with `cover`: more passes a loss must last before the owner hears of it |
 | `read_only` | `[]` | servers to add to the built-in `conduit`: looked at, never asked of `claude` |
 
-The view "MCP logins" shows every server, its state and when it was last live (`status.json` next to the plugin).
+The view "MCP logins" lists every MCP server the hub gives to sessions (the hub catalog plus the servers of enabled
+plugins; a plugin twin of a catalog server is listed once), by a name made for a person (Mobbin, Higgsfield, Granola,
+GitHub, MS365, Canva, not `plugin:canva:canva`; the machine name stays in the tooltip of the row). Each row has a state
+and when the server was last active (`status.json` next to the plugin).
 
-A row says only **live** or **lost** (with the reason). When a pass gets no clear answer (a timeout, no network to the
-server), it asks again up to 3 times with a pause, reconnecting the server in the sessions in between; still no answer -
-the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward one).
+A row says **active**, **lost** (with the reason) or **not checked** (grey, with the reason). The plugin starts no
+program and no stdio server: a program, or a server without a login of its own, goes by the word of the running sessions
+(connected - active, waits for a login - lost, no word - "not checked"). A server in `mcp_auth_ignore` (hub.json) is not
+followed: it sits in one grey line under the table, with no buttons and no alarms. When a pass gets no clear answer (a
+timeout, no network to the server), it asks again up to 3 times with a pause, reconnecting the server in the sessions in
+between; still no answer - the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward
+one).
 
-Each row has two buttons:
+Buttons of a row:
 
-- **Reconnect** - no login: posts `reconnect <server>`; the hub reconnects the server in every live session that has it
-  (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the server again at once and
-  the row shows the result.
-- **Log in again** - only for a server that logs in in a browser: posts `login <server>`; the process runs the same
-  `hub mcp login <session> <server>` you would type in a terminal (a live session that has the server, else the hub's
-  own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the end, then
-  the result (done, or why not); a login that went through makes the next check start at once.
+- **Connect another account** - on an active server that has a login of its own: posts `switch <server>`; the plugin
+  opens a terminal with `claude` in the login folder of that server and a hint: `/mcp`, the server, "Clear
+  authentication", then "Authenticate" and pick the other account in the browser. An active login is never switched by
+  the plugin itself: Claude Code keeps its logins in a store the plugin must not write to, and `claude mcp logout` would
+  wipe the login. A hub command for this (a login under another account, or a logout of one server, run by the hub)
+  would replace the terminal. The row says "terminal opened" or why it did not open.
+- **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the hub reconnects the server in every running
+  session that has it (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the
+  server again at once and the row shows the result.
+- **Log in** / **Log in again** - only for a server that logs in in a browser: posts `login <server>`; the process runs
+  the same `hub mcp login <session> <server>` you would type in a terminal (a running session that has the server, else
+  the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
+  end, then the result (done, or why not); a login that went through makes the next check start at once.
 
 The box **Reconnect automatically** under the table (on by default; your choice is kept in `state.json`): at the start
-and on every pass a server that is not live is reconnected, at most once in 10 minutes per server, with a line in the
+and on every pass a lost server is reconnected, at most once in 10 minutes per server, with a line in the
 log. A one-time login (`one_time`) is never reconnected. Only your own posts count, only for a server in the table.
 
 Run one pass by hand: `PYTHONPATH=<hub code> python3 main.py --once`.
 
 Tests: `PYTHONPATH=<hub code> python3 -m unittest discover -s tests` - no real `claude`, network or keychain.
+
+## По-русски
+
+Вид «Входы MCP» показывает все MCP-серверы, которые хаб выдаёт сессиям (каталог хаба и плагины), по-человечески:
+Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя лежит в подсказке строки. Состояние: **активен**,
+**отвалился** (с причиной) или **не проверяется** (серым, с причиной). Плагин не запускает программы и stdio-серверы:
+у программ и серверов без своего входа состояние берётся по слову работающих сессий. Серверы из `mcp_auth_ignore`
+(hub.json) показаны одной серой строкой «Не следим», без кнопок и тревог.
+
+У активного сервера со своим входом кнопка **Подключить другой**: плагин открывает терминал с `claude` в папке входа
+этого сервера и подсказкой (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой аккаунт в браузере).
+Сам плагин активный вход не переключает: хранилище входов Claude Code ему писать нельзя, а `claude mcp logout` стирает
+вход. У отвалившегося сервера кнопки **Переподключить** и **Войти**. Подробнее выше, в разделе про вид.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 

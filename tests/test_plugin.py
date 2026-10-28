@@ -175,7 +175,7 @@ class Served(Base):
         self.hub["sessions"]["worker"]["info"]["mcp"] = ["files"]
         with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("started a process")):
             res = self.run_once()
-        self.assertEqual(res["servers"], {})
+        self.assertEqual(res["servers"]["files"], {"state": "ok"})   # not started: a live session says it is connected
         self.assertEqual(self.asked, [])
 
     def test_header_server_is_not_judged_by_a_leftover_login(self):
@@ -198,7 +198,7 @@ class Pass(Base):
         self.assertEqual({s["state"] for s in res["servers"].values()}, {"ok"})
         self.assertEqual(self.notes(), [])
         posts = [d for t, d in self.facts if t == "ext.post"]
-        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 live, 0 lost"}])   # a human line only
+        self.assertEqual(posts, [{"plugin": "mcp-keeper", "text": "MCP: 4 active, 0 lost"}])   # a human line only
         with open(os.environ["MCP_KEEPER_STATUS"], encoding="utf-8") as f:
             self.assertEqual(json.load(f)["servers"]["canva"]["state"], "ok")   # the view's data - the file
         self.run_once(NOW + 900)
@@ -313,14 +313,15 @@ class Pass(Base):
         self.creds(canva={"serverUrl": URLS["canva"], "accessToken": "t", "refreshToken": "r",
                           "expiresAt": (NOW + 3600) * 1000})
         res = self.run_once()
-        self.assertNotIn("figma", res["servers"])
+        self.assertEqual(res["servers"]["figma"], {"state": "ok"})   # a session holds it connected: active, no alarm
         self.assertEqual((self.notes(), self.dev()), ([], []))
 
     def test_ignore_lists(self):
         self.config({"mcp_auth_ignore": ["canva"]}, {"ignore": ["figma"]})
         self.reject("canva", "figma")
         res = self.run_once(NOW)
-        self.assertEqual(sorted(res["servers"]), ["mobbin", "notion"])
+        self.assertEqual(sorted(res["servers"]), ["canva", "figma", "mobbin", "notion"])
+        self.assertEqual({n for n, s in res["servers"].items() if s.get("ignored")}, {"canva", "figma"})
 
     def test_unsettled_machine_does_not_ask_claude(self):
         self.expire("figma")
@@ -508,9 +509,16 @@ class Secrets(Base):
         got = main.clean_status({"v": 1, "at": 1, "every": 15,
                                  "servers": {"a": {"state": "ok", "ok_at": 2, "args": ["--token", "x"], "url": "https://u?k=1"},
                                              "b": {"state": "weird"}, "c": "text"}})
-        self.assertEqual(got["servers"], {"a": {"state": "ok", "ok_at": 2}})
+        self.assertEqual(got["servers"], {"a": {"state": "ok", "ok_at": 2, "title": "A"}})
         got = main.clean_status({"servers": {"a": {"state": "lost", "can_login": True}, "b": {"state": "lost", "can_login": "yes"}}})
-        self.assertEqual(got["servers"], {"a": {"state": "lost", "can_login": True}, "b": {"state": "lost"}})
+        self.assertEqual(got["servers"], {"a": {"state": "lost", "title": "A", "can_login": True},
+                                          "b": {"state": "lost", "title": "B"}})
+        got = main.clean_status({"servers": {"a": {"state": "ok", "can_switch": True, "title": "Mobbin"},
+                                             "b": {"state": "skip", "ignored": True, "title": "x" * 99},
+                                             "c": {"state": "ok", "can_switch": "yes", "ignored": 1}}})
+        self.assertEqual(got["servers"], {"a": {"state": "ok", "title": "Mobbin", "can_switch": True},
+                                          "b": {"state": "skip", "title": "B", "ignored": True},
+                                          "c": {"state": "ok", "title": "C"}})
 
 
 class Token(Base):
@@ -859,7 +867,7 @@ class FirstLogin(Base):
     def test_nobody_waits_nothing_is_said(self):
         self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
         res = self.run_once()
-        self.assertNotIn("mobbin", res["servers"])
+        self.assertEqual(res["servers"]["mobbin"], {"state": "ok"})   # active by a session's word, nothing to fix
         self.assertEqual(self.dev(), [])
 
     def test_status_line_counts_it(self):
@@ -1443,6 +1451,150 @@ class ViewReconnect(Base):
         self.assertTrue(main.load_state()["auto"])
 
 
+class ViewSwitch(Base):
+    """0.7.0: an active server has "Connect another account" instead of "Reconnect". The plugin cannot do it itself (the
+    login of Claude Code is not ours to write): the owner's click "switch <server>" opens a terminal with claude (a fake
+    opener here - no window is opened)."""
+
+    def setUp(self):
+        super().setUp()
+        self.reject("canva")
+        self.run_once()
+        self.hub["feeds"] = {main.NAME: []}
+        self.opened = []
+        self.opener = lambda folder, cmd, hint, server: self.opened.append((folder, cmd, hint, server))
+
+    def post(self, seq, text, by="owner"):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text, "ts": NOW})
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def test_only_an_active_server_with_a_login_can_switch(self):
+        rows = self.rows()
+        self.assertTrue(rows["figma"]["can_switch"])
+        self.assertNotIn("can_switch", rows["canva"], "a lost one is reconnected or logged in, not switched")
+
+    def test_click_opens_a_terminal_with_claude_and_a_hint(self):
+        self.post(1, "switch figma")
+        self.assertTrue(main.login_step(NOW + 1, opener=self.opener))
+        (folder, cmd, hint, server), = self.opened
+        self.assertEqual((server, cmd), ("figma", main.claude_cmd()))
+        self.assertTrue(os.path.isdir(folder))
+        self.assertIn("Figma", hint)
+        self.assertIn("Authenticate", hint)
+        self.assertEqual(self.rows()["figma"]["login"], {"state": "done", "at": NOW + 1, "act": "switch"})
+        self.assertNotIn("mcp.reconnect", [t for t, _ in self.facts], "the active server is not touched")
+
+    def test_a_server_that_cannot_switch_is_refused(self):
+        self.post(1, "switch canva")
+        self.post(2, "switch nosuch")
+        main.login_step(NOW + 1, opener=self.opener)
+        self.assertEqual(self.opened, [])
+        row = self.rows()["canva"]["login"]
+        self.assertEqual((row["state"], row["act"]), ("fail", "switch"))
+        self.assertNotIn("nosuch", self.rows())
+
+    def test_only_the_owner_clicks(self):
+        self.post(1, "switch figma", by="worker")
+        main.login_step(NOW + 1, opener=self.opener)
+        self.assertEqual(self.opened, [])
+
+    def test_no_claude_or_no_window_is_said_in_the_row(self):
+        with mock.patch.object(main, "claude_cmd", lambda: None):
+            self.post(1, "switch figma")
+            main.login_step(NOW + 1, opener=self.opener)
+        row = self.rows()["figma"]["login"]
+        self.assertEqual((row["state"], row["why"]), ("fail", main.tr("switch_noclaude")))
+
+        def boom(*a):
+            raise OSError("no terminal")
+        self.post(2, "switch figma")
+        main.login_step(NOW + 2, opener=boom)
+        self.assertEqual(self.rows()["figma"]["login"]["why"], main.tr("switch_failed"))
+        self.assertEqual(self.opened, [])
+
+    def test_the_row_of_a_terminal_goes_away_in_five_minutes(self):
+        self.post(1, "switch figma")
+        main.login_step(NOW + 1, opener=self.opener)
+        with mock.patch.object(main.time, "time", lambda: NOW + 1 + main.SWITCH_SHOW + 1):
+            main.write_status(main.load_state())
+        self.assertNotIn("login", self.rows()["figma"])
+
+    def test_windows_script_has_no_shell_specials_from_the_hint(self):
+        if os.name != "nt":
+            self.skipTest("the .cmd script is a Windows thing")
+        with mock.patch.object(subprocess, "Popen") as popen:
+            main.launch_terminal(TMP, ["claude"], 'a & b | c "d" %e% ^f', "figma")
+        script = read(os.path.join(main.HOME, "switch-figma.cmd"), raw=True)
+        echo = [x for x in script.splitlines() if x.startswith("echo a")]
+        self.assertEqual(len(echo), 1)
+        self.assertFalse(set('&|"%^') & set(echo[0][4:]), echo)
+        self.assertIn("call claude", script)
+        self.assertEqual(popen.call_args[0][0][:2], ["cmd.exe", "/c"])
+
+
+class AllServers(Base):
+    """0.7.0: every MCP the hub gives to its sessions is in the list, with a name for a person."""
+
+    def test_names_for_a_person(self):
+        names = {"mobbin": "Mobbin", "higgsfield": "Higgsfield", "granola": "Granola", "plugin:canva:canva": "Canva",
+                 "github": "GitHub", "grafana": "Grafana", "ms365": "MS365", "icons8mcp": "Icons8",
+                 "parallel-search": "Parallel Search", "pencil": "Pencil", "openai-developer-docs": "OpenAI Docs",
+                 "teams": "Teams", "atlassian": "Atlassian", "buffer": "Buffer", "figma": "Figma",
+                 "plugin:github:github": "GitHub"}
+        for name, shown in names.items():
+            self.assertEqual(main.human(name), shown, name)
+
+    def test_rows_carry_the_title_and_the_machine_name_stays_the_key(self):
+        self.run_once()
+        rows = read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+        self.assertEqual(rows["figma"]["title"], "Figma")
+
+    def test_a_program_and_a_server_without_a_login_are_listed_by_the_sessions_word(self):
+        self.config({"mcp": {"files": {"server": {"command": "npx", "args": ["-y", "files-mcp"]}},
+                             "docs": {"server": {"type": "http", "url": "https://docs.example/mcp"}},
+                             "pencil": {"server": {"command": "pencil"}}}})
+        self.hub["sessions"]["worker"]["info"].update(mcp=["files", "docs"], mcp_auth=["pencil"])
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("started a process")):
+            res = self.run_once()["servers"]
+        self.assertEqual(res["files"], {"state": "ok"})
+        self.assertEqual(res["pencil"]["state"], "lost")
+        self.assertTrue(res["pencil"]["unclear"], "a session's word alone raises no alarm")
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+
+    def test_no_word_from_sessions_is_not_checked_with_the_reason(self):
+        self.config({"mcp": {"files": {"server": {"command": "npx", "args": ["-y", "files-mcp"]}}}})
+        res = self.run_once()["servers"]
+        self.assertEqual(res["files"]["state"], "skip")
+        self.assertIn("program", res["files"]["why"])
+        self.assertIn("no word", res["files"]["why"])
+
+    def test_ignored_server_is_a_quiet_row(self):
+        self.config({"mcp_auth_ignore": ["spytrend"],
+                     "mcp": {"spytrend": {"server": {"type": "http", "url": "https://s.example/mcp"}}}})
+        res = self.run_once()["servers"]
+        self.assertEqual(res["spytrend"], {"state": "skip", "ignored": True})
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+        self.assertTrue(read(os.environ["MCP_KEEPER_STATUS"])["servers"]["spytrend"]["ignored"])
+
+    def test_the_twin_of_a_catalog_server_from_a_plugin_is_not_listed_twice(self):
+        twin = {"plugin:figma:figma": {"type": "http", "url": URLS["figma"]}}
+        with mock.patch.object(main, "plugin_servers", lambda: twin):
+            res = self.run_once()["servers"]
+        self.assertNotIn("plugin:figma:figma", res)
+        self.assertIn("figma", res)
+
+
+class Manifest(unittest.TestCase):
+    def test_version_and_wording(self):
+        m = read(os.path.join(ROOT, "hub-plugin.json"))
+        self.assertEqual(m["version"], "0.7.0")
+        text = json.dumps(m, ensure_ascii=False).lower()
+        self.assertNotIn("live", text.replace("deliver", ""))
+        self.assertNotIn("жив", text)
+
+
 class JsStrings(unittest.TestCase):
     def test_view_keys_match_and_cyrillic_only_in_ru(self):
         import re
@@ -1452,7 +1604,7 @@ class JsStrings(unittest.TestCase):
         end = src.index("\n};", ru)
         keys = lambda part: set(re.findall(r"(\w+): \"", part))
         self.assertEqual(keys(src[en:ru]), keys(src[ru:end]))
-        self.assertTrue({"reconnect", "auto", "relogin"} <= keys(src[en:ru]))
+        self.assertTrue({"reconnect", "auto", "relogin", "switch", "ignored"} <= keys(src[en:ru]))
         self.assertNotIn("later", keys(src[en:ru]))
         self.assertFalse(re.search("[а-яА-ЯёЁ]", src[:ru] + src[end:]))
 
