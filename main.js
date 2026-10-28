@@ -15,6 +15,10 @@ const STR = {
     switch: "Connect another account", no_account: "no account", switch_sent: "opening a terminal…",
     switch_done: "terminal opened: follow the steps in it", switch_fail: "the terminal did not open",
     ignored: "Not followed",
+    add: "Add MCP", add_name: "Name", add_url: "Address, https://…", add_go: "Add", add_cancel: "Cancel",
+    add_hint: "The service gives the name and the address. A key is not typed here: you log in in the browser.",
+    add_bad: "Check the name (letters, digits, - and _) and the address (https, no key or parameters in it)",
+    add_sent: "adding…", add_ok: "Added: {name}", add_fail: "Not added", add_restart: "Sessions get it after they restart.",
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
@@ -30,6 +34,10 @@ const STR = {
     switch: "Подключить другой", no_account: "без аккаунта", switch_sent: "открываю терминал…",
     switch_done: "терминал открыт: дальше по шагам в нём", switch_fail: "терминал не открылся",
     ignored: "Не следим",
+    add: "Добавить MCP", add_name: "Название", add_url: "Адрес, https://…", add_go: "Добавить", add_cancel: "Отмена",
+    add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь в браузере.",
+    add_bad: "Проверь название (буквы, цифры, - и _) и адрес (https, без ключа и параметров)",
+    add_sent: "добавляю…", add_ok: "Добавлено: {name}", add_fail: "Не добавлено", add_restart: "Сессии получат его после перезапуска.",
   },
 };
 const ORDER = { lost: 0, first: 1, ok: 3, skip: 4 };
@@ -39,6 +47,9 @@ let hub;
 let last = { id: 0, at: 0, data: null };
 const sent = {};   // server -> {at, act}: the row says what was asked until the process answers
 const SENT_FOR = 20000;
+const form = { open: false, name: "", url: "", bad: false, at: 0, focus: "" };   // "Add MCP": what is typed survives a redraw
+const NAME_OK = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
+const URL_OK = /^(https:\/\/[A-Za-z0-9.-]{1,200}(:\d{1,5})?|http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?)(\/[A-Za-z0-9._~%+/-]{0,200})?$/;   // like the process: no login, query or key
 
 function tr(key, params = {}) {
   const table = Object.hasOwn(STR, hub.lang) ? STR[hub.lang] : STR.en;
@@ -54,7 +65,15 @@ function when(sec) {
 // a login is open: the process writes its end to status.json, the view looks more often until then
 function waiting() {
   const rows = Object.entries((last.data && last.data.servers) || {});
-  return rows.some(([n, r]) => (r.login && ["wait", "sent"].includes(r.login.state)) || mine(n));
+  const add = (last.data && last.data.add) || {};
+  return rows.some(([n, r]) => (r.login && ["wait", "sent"].includes(r.login.state)) || mine(n)) || adding() ||
+    (add.login && add.login.state === "wait");
+}
+
+// the click on "Add" is waiting for the process: its answer (data.add) is newer than the click
+function adding() {
+  const add = (last.data && last.data.add) || {};
+  return !!form.at && Date.now() - form.at < 180000 && !(add.at && add.at * 1000 >= form.at - 1000);
 }
 
 async function load(snap, force = false) {
@@ -125,6 +144,72 @@ function actionCell(row, name, s) {
     grey.style.cssText = "opacity:.55";
     td.append(grey);
   }
+}
+
+// "Add MCP" under the table: a name and an address (https). The click posts "add <name> <address>"; the process adds the
+// server the hub's own way, opens the login, and says how it went in data.add.
+function addBox(d) {
+  const wrap = hub.el("div", "mk-add");
+  wrap.style.cssText = "margin-top:14px";
+  const add = d.add || null;
+  if (adding()) {
+    wrap.append(hub.el("p", "mk-add-sent", tr("add_sent")));
+    return wrap;
+  }
+  if (add) {
+    const ok = add.state === "done";
+    const line = hub.el("div", ok ? "mk-done" : "mk-fail", ok ? tr("add_ok", { name: add.name }) : tr("add_fail") + (add.why ? ": " + add.why : ""));
+    line.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-bottom:6px;white-space:normal";
+    wrap.append(line);
+    if (ok) {
+      const l = add.login || {};
+      const text = l.state === "wait" ? tr("login_wait") : l.state === "fail" ? tr("login_fail") + (l.why ? ": " + l.why : "") : tr("add_restart");
+      const note = hub.el("div", "mk-add-login", text);
+      note.style.cssText = "font-size:.9em;opacity:.8;margin-bottom:6px;white-space:normal";
+      wrap.append(note);
+    }
+  }
+  if (!form.open) {
+    const open = hub.el("button", "btn mk-add-open", tr("add"));
+    open.type = "button";
+    open.onclick = () => { form.open = true; form.bad = false; draw(root_); };
+    wrap.append(open);
+    return wrap;
+  }
+  const row = hub.el("div", "mk-add-form");
+  row.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center";
+  const field = (key, ph, width) => {
+    const input = hub.el("input", "mk-add-" + key);
+    input.type = "text";
+    input.placeholder = tr(ph);
+    input.value = form[key];
+    input.style.cssText = "padding:6px 8px;width:" + width;
+    input.oninput = () => { form[key] = input.value; form.bad = false; };
+    input.onfocus = () => { form.focus = key; };
+    return input;
+  };
+  const go = hub.el("button", "btn mk-add-go", tr("add_go"));
+  go.type = "button";
+  go.onclick = () => {
+    const name = form.name.trim();
+    const url = form.url.trim();
+    if (!NAME_OK.test(name) || !URL_OK.test(url)) { form.bad = true; draw(root_); return; }
+    form.at = Date.now();
+    form.open = false;
+    form.name = form.url = "";
+    hub.postFeed("add " + name + " " + url);   // the process reads the channel and does what the hub commands would
+    setTimeout(() => load(null, true).then(() => draw(root_)).catch(() => {}), 6000);
+    draw(root_);
+  };
+  const cancel = hub.el("button", "btn mk-add-cancel", tr("add_cancel"));
+  cancel.type = "button";
+  cancel.onclick = () => { form.open = false; form.bad = false; draw(root_); };
+  row.append(field("name", "add_name", "10em"), field("url", "add_url", "20em"), go, cancel);
+  wrap.append(row);
+  const hint = hub.el("p", form.bad ? "mk-add-bad" : "mk-hint", tr(form.bad ? "add_bad" : "add_hint"));
+  hint.style.cssText = "margin:4px 0 0;font-size:.9em;opacity:" + (form.bad ? "1" : ".7") + (form.bad ? ";color:" + COLOR.lost : "");
+  wrap.append(hint);
+  return wrap;
 }
 
 function autoBox(d) {
@@ -198,8 +283,11 @@ function draw(root) {
     note.style.cssText = "margin:10px 0 0;opacity:.6;font-size:.9em";
     wrap.append(note);
   }
+  wrap.append(addBox(d));
   wrap.append(autoBox(d));
   root.append(wrap);
+  const typed = form.open && form.focus ? wrap.querySelector(".mk-add-" + form.focus) : null;
+  if (typed) typed.focus();   // a redraw (the status changed) does not take the cursor away
 }
 
 export default function register(h) {

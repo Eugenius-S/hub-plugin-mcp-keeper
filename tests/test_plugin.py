@@ -1269,6 +1269,153 @@ class ViewLogin(Base):
         self.assertNotIn("login", self.rows()["mobbin"])
 
 
+class ViewAdd(Base):
+    """0.8.0 "Add MCP": the owner's post "add <name> <address>" -> `claude mcp add`, `hub tools import mcp`, the login. Every
+    command is a fake here: nothing is added to ~/.claude.json or to a hub."""
+
+    GOOD = "https://mcp.example.com/mcp"
+
+    def setUp(self):
+        super().setUp()
+        self.run_once()
+        self.ran, self.answers = [], {}
+        self.hub["feeds"] = {main.NAME: []}
+        self.login_done = None
+        for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
+                  mock.patch.object(main, "claude_cmd", lambda: ["/bin/claude"]),
+                  mock.patch.object(main, "login_result", lambda server: self.login_done),
+                  mock.patch.object(main, "run_limited", self.fake_run)):
+            p.start()
+            self.addCleanup(p.stop)
+        main.RECHECK_NOW.clear()
+        self.before = (read(os.environ["HUB_CONFIG"], raw=True), os.path.exists(main.claude_json()))
+
+    def fake_run(self, cmd, timeout, merge=True):
+        self.ran.append(cmd)
+        return self.answers.get(self.kind(cmd), (0, "ok\n"))
+
+    @staticmethod
+    def kind(cmd):
+        if cmd[1:3] == ["mcp", "add"]:
+            return "add"
+        if cmd[1:3] == ["mcp", "remove"]:
+            return "remove"
+        if cmd[2:4] == ["tools", "import"]:
+            return "import"
+        return "login" if cmd[2:4] == ["mcp", "login"] else "other"
+
+    def kinds(self):
+        return [self.kind(c) for c in self.ran]
+
+    def post(self, seq, text, by="owner", ts=NOW):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text, "ts": ts})
+
+    def status(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])
+
+    def test_click_adds_the_standard_way_then_opens_the_login(self):
+        self.post(1, "add newsvc " + self.GOOD)
+        self.assertTrue(main.login_step(NOW + 1))
+        self.assertEqual(self.ran[0], ["/bin/claude", "mcp", "add", "--transport", "http", "-s", "user", "newsvc", self.GOOD])
+        self.assertEqual(self.ran[1][2:], ["tools", "import", "mcp", "newsvc", "--about", "Newsvc"])
+        self.assertEqual(self.ran[2][2:], ["mcp", "login", "hub", "newsvc"])
+        self.assertEqual(self.kinds(), ["add", "import", "login"])
+        add = self.status()["add"]
+        self.assertEqual((add["state"], add["name"], add["login"]), ("done", "newsvc", {"state": "wait"}))
+        self.assertTrue(main.RECHECK_NOW.is_set(), "the new server joins the table at the next pass")
+
+    def test_the_login_that_ended_is_shown_under_the_add(self):
+        self.post(1, "add newsvc " + self.GOOD)
+        main.login_step(NOW + 1)
+        self.login_done = (0, "logged in")
+        main.login_step(NOW + 20)
+        self.assertEqual(self.status()["add"]["login"], {"state": "done"})
+
+    def test_a_login_that_fails_leaves_the_server_added(self):
+        self.answers["login"] = (1, "the browser was closed\n")
+        self.post(1, "add newsvc " + self.GOOD)
+        main.login_step(NOW + 1)
+        add = self.status()["add"]
+        self.assertEqual(add["state"], "done")
+        self.assertEqual(add["login"]["state"], "fail")
+        self.assertEqual(add["login"]["why"], "the browser was closed")
+
+    def test_a_local_http_address_is_taken(self):
+        self.assertEqual(main.add_server("local", "http://localhost:8080/mcp", self.hub, NOW)["state"], "done")
+
+    def test_bad_names_and_addresses_run_nothing(self):
+        for name in ("", "-x", "a;b", "a b", "a/b", "x" * 41, "имя"):
+            self.assertEqual(main.add_server(name, self.GOOD, self.hub, NOW)["state"], "fail", name)
+        for url in ("http://example.com/mcp", "https://user:pw@example.com/mcp", "https://example.com/mcp?key=abc",
+                    "https://example.com/mcp#x", "ftp://example.com/mcp", "https://example.com/a b", "https://exa mple.com",
+                    "https://example.com/mcp\"&calc", "https://", "example.com/mcp", "https://example.com/mcp%0A"[:0]):
+            got = main.add_server("svc", url, self.hub, NOW)
+            self.assertEqual(got["state"], "fail", url)
+            self.assertNotIn("example", got["why"])
+        self.assertEqual(self.ran, [])
+
+    def test_a_name_or_an_address_that_is_there_is_refused(self):
+        write(main.claude_json(), {"mcpServers": {"mine": {"type": "http", "url": "https://mcp.mine.example/mcp"}}})
+        cases = (("figma", self.GOOD), ("Figma", self.GOOD), ("mine", self.GOOD),
+                 ("other", URLS["figma"]), ("other", URLS["figma"] + "/"), ("other", "https://mcp.mine.example/mcp"))
+        for name, url in cases:
+            got = main.add_server(name, url, self.hub, NOW)
+            self.assertEqual((got["state"], got["why"]), ("fail", "this name or address is already there"), (name, url))
+        self.assertEqual(self.ran, [])
+
+    def test_claude_that_fails_stops_before_the_hub(self):
+        self.answers["add"] = (1, "https://secret.example/?k=1\nerror: no such transport\n")
+        got = main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual(got["state"], "fail")
+        self.assertEqual(got["why"], "Claude Code did not add the server: error: no such transport")
+        self.assertEqual(self.kinds(), ["add"])
+
+    def test_a_hub_that_refuses_gets_the_entry_taken_back(self):
+        self.answers["import"] = (1, "no such server\n")
+        got = main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual(got["why"], "the hub did not take the server: no such server")
+        self.assertEqual(self.kinds(), ["add", "import", "remove"])
+        self.assertEqual(self.ran[-1], ["/bin/claude", "mcp", "remove", "-s", "user", "svc"])
+
+    def test_no_claude_and_no_hub_are_fails_not_crashes(self):
+        with mock.patch.object(main, "claude_cmd", lambda: None):
+            self.assertEqual(main.add_server("svc", self.GOOD, self.hub, NOW)["why"], "Claude Code was not found")
+        with mock.patch.object(main, "hub_bin", lambda: None):
+            self.assertEqual(main.add_server("svc", self.GOOD, self.hub, NOW)["state"], "fail")
+        self.assertEqual(self.ran, [])
+
+    def test_the_post_counts_once_only_from_the_owner_while_fresh(self):
+        self.post(1, "add svc " + self.GOOD, by="worker")
+        self.post(2, "add svc " + self.GOOD, ts=NOW - main.LOGIN_FRESH - 5)
+        self.post(3, "add svc " + self.GOOD + "?key=1")
+        self.post(4, "add svc")
+        self.post(5, "add svc " + self.GOOD + " extra")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        self.post(6, "add svc " + self.GOOD)
+        main.login_step(NOW + 2)
+        main.login_step(NOW + 3)
+        self.assertEqual(self.kinds().count("add"), 1, "the same post does not add a second time")
+
+    def test_the_result_stays_an_hour_and_holds_no_address_or_key(self):
+        self.answers["add"] = (1, "bad https://secret.example/?k=1 token=abc\n")
+        self.post(1, "add svc " + self.GOOD)
+        main.login_step(NOW + 1)
+        self.assertEqual(self.status()["add"]["state"], "fail")
+        text = read(os.environ["MCP_KEEPER_STATUS"], raw=True) + read(main.login_path(), raw=True)
+        for secret in ("secret.example", "token=abc"):
+            self.assertNotIn(secret, text)
+        self.assertNotIn(self.GOOD, read(os.environ["MCP_KEEPER_STATUS"], raw=True))
+        with mock.patch.object(main.time, "time", lambda: NOW + 1 + main.ADD_SHOW + 1):
+            main.write_status(main.load_state())
+        self.assertNotIn("add", self.status())
+
+    def test_the_plugin_writes_neither_the_hub_settings_nor_the_claude_file_itself(self):
+        self.post(1, "add svc " + self.GOOD)
+        main.login_step(NOW + 1)
+        self.assertEqual(self.before, (read(os.environ["HUB_CONFIG"], raw=True), os.path.exists(main.claude_json())))
+
+
 class Icon(unittest.TestCase):
     """The menu draws a view icon with a mask: one colour, no background; icon.png is the cover of the market."""
 
@@ -1693,7 +1840,7 @@ class SwitchKinds(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.7.3")
+        self.assertEqual(m["version"], "0.8.0")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -1752,6 +1899,7 @@ class ViewButtons(unittest.TestCase):
 
     def test_an_active_server_without_a_login_of_its_own_has_no_buttons(self):
         got = self.buttons({"canva": {"state": "ok", "title": "Canva", "can_login": True}})
+        self.assertEqual(got.pop("", None), ["mk-add-open"], "0.8.0: the one button outside the table rows is \"Add MCP\"")
         self.assertEqual(got, {})
 
     def test_a_server_without_an_account_shows_grey_words_and_no_button(self):
@@ -1767,6 +1915,113 @@ class ViewButtons(unittest.TestCase):
         self.assertNotIn("can_login", got["a"])
         self.assertTrue(got["a"]["can_switch"])
         self.assertTrue(got["b"]["can_login"])
+
+
+VIEW_ADD = """
+import { pathToFileURL } from "node:url";
+const arg = JSON.parse(process.argv[2]);
+const has = (n, c) => (n.cls || "").split(" ").includes(c);
+const node = (tag, cls = "", text = "") => {
+  const n = { tag, cls, text, kids: [], style: {}, firstChild: null, value: "" };
+  n.append = (...k) => { n.kids.push(...k); n.firstChild = n.kids[0] || null; };
+  n.replaceChildren = (...k) => { n.kids = []; n.firstChild = null; n.append(...k); };
+  n.querySelector = (sel) => find(n, sel.slice(1));
+  n.focus = () => {};
+  return n;
+};
+const find = (n, c) => {
+  if (has(n, c)) return n;
+  for (const k of n.kids) { const f = k && k.tag ? find(k, c) : null; if (f) return f; }
+  return null;
+};
+const all = (n, out = []) => { out.push(n); n.kids.forEach((k) => k && k.tag && all(k, out)); return out; };
+const posts = [];
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ v: 1, at: 1, every: 15, auto: true, servers: {}, ...arg.extra }) });
+const view = {};
+const mod = await import(pathToFileURL(process.argv[1]).href);
+mod.default({ lang: "en", el: node, postFeed: (t) => posts.push(t), addView: (v) => Object.assign(view, v) });
+const root = node("div");
+view.render(root, {});
+await new Promise((r) => setTimeout(r, 30));
+for (const step of arg.steps) {
+  if (step.click) find(root, step.click).onclick();
+  if (step.type) {
+    const input = find(root, step.type[0]);
+    input.onfocus();
+    input.value = step.type[1];
+    input.oninput();
+  }
+  await new Promise((r) => setTimeout(r, 10));
+}
+const texts = {};
+for (const n of all(root)) for (const c of (n.cls || "").split(" ")) if (c.startsWith("mk-") && n.text) texts[c] = n.text;
+const classes = all(root).flatMap((n) => (n.cls || "").split(" ")).filter((c) => c.startsWith("mk-add"));
+console.log(JSON.stringify({ posts, texts, classes }));
+process.exit(0);
+"""
+
+
+class ViewAddForm(unittest.TestCase):
+    """0.8.0: the "Add MCP" button and form, run in node with a stub hub (no browser)."""
+
+    def run_view(self, steps, extra=None):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("no node")
+        arg = {"steps": steps, "extra": extra or {}}
+        got = subprocess.run([node, "--input-type=module", "-e", VIEW_ADD, os.path.join(ROOT, "main.js"), json.dumps(arg)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        return json.loads(got.stdout)
+
+    FILL = [{"click": "mk-add-open"}, {"type": ["mk-add-name", "newsvc"]}, {"type": ["mk-add-url", "https://mcp.example.com/mcp"]}]
+
+    def test_the_button_is_under_the_table_and_opens_a_form(self):
+        got = self.run_view([])
+        self.assertEqual(got["texts"]["mk-add-open"], "Add MCP")
+        self.assertNotIn("mk-add-form", got["classes"])
+        got = self.run_view([{"click": "mk-add-open"}])
+        self.assertTrue({"mk-add-name", "mk-add-url", "mk-add-go", "mk-add-cancel"} <= set(got["classes"]))
+        self.assertNotIn("mk-add-bad", got["classes"])
+
+    def test_cancel_closes_the_form_without_a_post(self):
+        got = self.run_view([{"click": "mk-add-open"}, {"click": "mk-add-cancel"}])
+        self.assertIn("mk-add-open", got["classes"])
+        self.assertEqual(got["posts"], [])
+
+    def test_a_good_name_and_address_post_one_add(self):
+        got = self.run_view(self.FILL + [{"click": "mk-add-go"}])
+        self.assertEqual(got["posts"], ["add newsvc https://mcp.example.com/mcp"])
+        self.assertEqual(got["texts"]["mk-add-sent"], "adding…")
+        self.assertNotIn("mk-add-open", got["classes"], "while it is added the form is not offered again")
+
+    def test_a_bad_name_or_address_posts_nothing_and_says_why(self):
+        bad = ({"type": ["mk-add-name", "a b"]}, {"type": ["mk-add-url", "http://example.com/mcp"]},
+               {"type": ["mk-add-url", "https://example.com/mcp?key=abc"]}, {"type": ["mk-add-url", "https://u:p@example.com/mcp"]})
+        for step in bad:
+            steps = [{"click": "mk-add-open"}, {"type": ["mk-add-name", "newsvc"]}, {"type": ["mk-add-url", "https://mcp.example.com/mcp"]},
+                     step, {"click": "mk-add-go"}]
+            got = self.run_view(steps)
+            self.assertEqual(got["posts"], [], step)
+            self.assertIn("mk-add-bad", got["classes"], step)
+            self.assertTrue(got["texts"]["mk-add-bad"].startswith("Check the name"), step)
+
+    def test_the_answer_of_the_process_is_shown(self):
+        add = {"state": "fail", "name": "newsvc", "at": 5, "why": "this name or address is already there"}
+        got = self.run_view([], {"add": add})
+        self.assertEqual(got["texts"]["mk-fail"], "Not added: this name or address is already there")
+        self.assertIn("mk-add-open", got["classes"], "after a failure the owner can try again")
+        add = {"state": "done", "name": "newsvc", "at": 5, "login": {"state": "wait"}}
+        got = self.run_view([], {"add": add})
+        self.assertEqual(got["texts"]["mk-done"], "Added: newsvc")
+        self.assertNotIn("Sessions get it", got["texts"]["mk-add-login"])
+        add["login"] = {"state": "done"}
+        got = self.run_view([], {"add": add})
+        self.assertEqual(got["texts"]["mk-add-login"], "Sessions get it after they restart.")
+        add["login"] = {"state": "fail", "why": "the browser was closed"}
+        got = self.run_view([], {"add": add})
+        self.assertTrue(got["texts"]["mk-add-login"].endswith(": the browser was closed"))
 
 
 class JsStrings(unittest.TestCase):
@@ -1829,6 +2084,22 @@ class CatalogRules(unittest.TestCase):
             code = f.read()
         self.assertIn('"switch-" + safe + ".cmd"', code)
         self.assertIn('".command" if sys.platform == "darwin" else ".sh"', code)
+
+    def test_readme_says_that_add_mcp_writes_the_claude_file_and_the_hub_settings(self):
+        """0.8.0: the one place where the plugin's programs write ~/.claude.json and hub.json is said, with the commands."""
+        src = self.readme()
+        for word in ("**Add MCP, on a click.**", "claude mcp add --transport http -s user", "hub tools import mcp",
+                     "claude mcp remove", "`~/.claude.json`", "Exception, only on your click on Add MCP",
+                     "Добавить MCP"):
+            self.assertIn(word, src)
+        self.assertNotIn("It never writes the credential stores, `~/.claude.json`", src, "the old promise is no longer true")
+
+    def test_the_commands_in_the_readme_are_the_ones_the_code_runs(self):
+        with open(os.path.join(ROOT, "main.py"), encoding="utf-8") as f:
+            code = f.read()
+        self.assertIn('["mcp", "add", "--transport", "http", "-s", "user", name, url]', code)
+        self.assertIn('"tools", "import", "mcp", name, "--about"', code)
+        self.assertIn('["mcp", "remove", "-s", "user", name]', code)
 
     def test_the_manifest_asks_for_the_page_and_the_process_only(self):
         with open(os.path.join(ROOT, "hub-plugin.json"), encoding="utf-8") as f:

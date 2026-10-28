@@ -106,12 +106,15 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
   folder of the hub state `state.json` (the pass state and your choice of automatic reconnect), `login.json` (the end of
   a login you started from the view) and the switch script below. Events to the hub (a message to the owner, a line to
   the feed, a reconnect request, a line to a session) go through the hub's spool folder, the way every plugin process
-  posts. It never writes the credential stores, `~/.claude.json`, `hub.json` or another plugin's files. A short log goes
-  to the process output, which the hub keeps in its own log.
+  posts. It never writes the credential stores or another plugin's files, and its own code never writes
+  `~/.claude.json` or `hub.json`. **Exception, only on your click on Add MCP (see below):** the programs it starts
+  then write them: `claude mcp add` writes the server into `~/.claude.json`, `hub tools import mcp` writes it into the
+  `mcp` section of `hub.json`. A short log goes to the process output, which the hub keeps in its own log.
 - **Sends:** a server's own address gets one `initialize` request with the stored token (https, or localhost; no
   redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
 - **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
-  your click on **Log in**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
+  your click on **Log in**, or after **Add MCP**), `claude mcp add` and `claude mcp remove` (only for the server you
+  add: the second one takes it back if the hub refuses it), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
   (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Connect
   another account**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
   when the server's own catalog entry names it.
@@ -126,6 +129,15 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
   program with an unusual word among its arguments (a key, a shell character) is not run. Only your own click in the
   view starts it; nothing opens a window by itself. The script keeps no secret: a folder, a hint and the program's
   words; no key is read, shown or written, and no new address is called.
+- **Add MCP, on a click.** Under the table, **Add MCP** takes a name and an address that the service itself gives.
+  The name is letters, digits, `-` and `_` (up to 40); the address is `https`, or `http` only for localhost, with no
+  login, query or key in it. Your click posts `add <name> <address>` to the plugin's feed (only your own, fresh post
+  counts, once). The process then does what you would type: `claude mcp add --transport http -s user <name> <address>`,
+  then `hub tools import mcp <name>`, then `hub mcp login` for the browser login, the same as **Log in**. A name or an
+  address that is already in the hub catalog, in the hub settings or in `~/.claude.json` is refused with the reason,
+  nothing is run. If the hub refuses the entry, `claude mcp remove` takes it back. No key or token is typed, read or
+  written: the login happens in the browser, in Claude Code's own store. The address is not kept in `status.json` or
+  `login.json`; they hold the name, the result and a short reason. Sessions get the new server after they restart.
 
 The plugin asks for the page and the process, nothing more.
 
@@ -217,13 +229,24 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 
 Что плагин читает, пишет и куда шлёт: читает `hub.json`, состояние хаба и сохранённые входы MCP Claude Code (только
 чтение); пишет только в свои места (`status.json` рядом с плагином, `state.json`, `login.json` и скрипт ниже в своей папке
-состояния, события в хаб через его spool); входы Claude Code, `~/.claude.json` и `hub.json` не пишет; в сеть ходит только
+состояния, события в хаб через его spool); входы Claude Code и чужие файлы не пишет, и сам его код не пишет
+`~/.claude.json` и `hub.json`. Исключение, только по клику **Добавить MCP**: запущенные им программы пишут: `claude mcp
+add` добавляет сервер в `~/.claude.json`, `hub tools import mcp` в раздел `mcp` файла `hub.json`. В сеть процесс ходит только
 на собственный адрес сервера с сохранённым токеном. По клику **Подключить другой** процесс пишет скрипт
 `switch-<сервер>.cmd` (Windows), `.command` (macOS) или `.sh` (Linux) в свою папку состояния и открывает окно терминала:
 с `claude` в папке входа сервера, либо с собственной программой MS365 или Teams (из описания сервера в хабе: выход и
 вход заново), либо только со словами для сервера с ключом. Программа с необычным словом среди аргументов (ключ, символ
 оболочки) не запускается. Окно открывает только ваш клик, секретов в скрипте нет, ключи не читаются и не пишутся, новых
-адресов нет. Права плагина: страница и процесс.
+адресов нет.
+
+Под таблицей кнопка **Добавить MCP**: название (буквы, цифры, `-`, `_`, до 40 знаков) и адрес, который даёт сам сервис
+(`https`, `http` только для localhost, без логина, параметров и ключа). Клик кладёт в ленту плагина `add <название>
+<адрес>` (считается только ваш свежий пост, один раз). Процесс делает то же, что набрали бы вы: `claude mcp add --transport
+http -s user`, затем `hub tools import mcp`, затем `hub mcp login` для входа в браузере, как у кнопки **Войти**. Название или
+адрес, которые уже есть в каталоге хаба, настройках хаба или `~/.claude.json`, отклоняются с причиной, ничего не
+запускается. Если хаб не принял запись, `claude mcp remove` её убирает. Ключ не вводится, не читается и не пишется: вход в
+браузере, в хранилище самого Claude Code. Адрес в `status.json` и `login.json` не хранится. Сессии получают сервер после
+перезапуска. Права плагина: страница и процесс.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 

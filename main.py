@@ -153,6 +153,12 @@ STR = {
         "login_nohub": "the hub command was not found",
         "login_failed": "the login did not go through (code {code})",
         "login_timeout": "no login within {minutes} min",
+        "add_bad_name": "the name may hold letters, digits, - and _ (up to 40 characters)",
+        "add_bad_url": "the address must be https (http only for this machine), with no login, key or query in it",
+        "add_exists": "this name or address is already there",
+        "add_noclaude": "Claude Code was not found",
+        "add_claude_failed": "Claude Code did not add the server",
+        "add_hub_failed": "the hub did not take the server",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает — хаб освежит его, когда сессия "
@@ -211,6 +217,12 @@ STR = {
         "login_nohub": "команда hub не найдена",
         "login_failed": "вход не прошёл (код {code})",
         "login_timeout": "не вошли за {minutes} мин",
+        "add_bad_name": "в названии буквы, цифры, - и _ (до 40 знаков)",
+        "add_bad_url": "адрес должен быть https (http только для этой машины), без входа, ключа и параметров в нём",
+        "add_exists": "такое название или адрес уже есть",
+        "add_noclaude": "Claude Code не найден",
+        "add_claude_failed": "Claude Code не добавил сервер",
+        "add_hub_failed": "хаб не принял сервер",
     },
 }
 
@@ -1367,6 +1379,16 @@ def write_status(st):
             why = r.get("why") if isinstance(r.get("why"), str) and "://" not in r["why"] else None
             out["servers"][n]["login"] = {"state": r.get("state"), "at": r.get("at"), **({"why": why[:160]} if why else {}),
                                           **({"act": r["act"]} if r.get("act") in ("reconnect", "switch") else {})}
+    login = read_json(login_path()) or {}
+    add = login.get("add")
+    if isinstance(add, dict) and add.get("state") in ("done", "fail") and now - (add.get("at") or 0) < ADD_SHOW:
+        why = add.get("why") if isinstance(add.get("why"), str) and "://" not in add["why"] else None
+        row = (login.get("rows") or {}).get(add.get("name")) if add["state"] == "done" else None
+        out["add"] = {"state": add["state"], "name": str(add.get("name"))[:60], "at": add.get("at"),
+                      **({"why": why[:160]} if why else {}),
+                      **({"login": {"state": row.get("state"),
+                                    **({"why": str(row["why"])[:160]} if isinstance(row.get("why"), str) and "://" not in row["why"] else {})}}
+                         if isinstance(row, dict) else {})}
     write_json(status_path(), out)
 
 
@@ -1633,12 +1655,55 @@ def open_terminal(server, hub_st, now, opener=None, kind=None):
     return {"state": "done", "act": "switch", "at": now}
 
 
-CLICK = re.compile(r"(login|reconnect|switch) (\S{1,128})|auto (on|off)")
+ADD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
+ADD_URL = re.compile(r"https?://[A-Za-z0-9.\[\]:-]{1,200}(?:/[A-Za-z0-9._~%+/-]{0,200})?")   # no login, query or fragment: a key hides there
+ADD_RUN = 60              # `claude mcp add` - limit, seconds
+IMPORT_RUN = 40           # `hub tools import mcp` - limit, seconds
+ADD_SHOW = 3600           # the result of an add stays under the table this long
+
+
+def last_line(out, size=160):
+    lines = [x.strip() for x in str(out).splitlines() if x.strip() and "://" not in x]
+    return lines[-1][:size] if lines else ""
+
+
+def add_server(name, url, hub_st, now, run=None):
+    """Add MCP (0.8.0), the standard way and nothing else: `claude mcp add --transport http -s user <name> <address>`, then
+    `hub tools import mcp <name> --about <name>` (the hub copies the entry into its catalog), then the same login as the
+    "Log in" button. The owner types a name and an address (the service gives them), never a key: an address with a login,
+    a key or a query in it is refused, so nothing secret reaches ~/.claude.json or hub.json from here. A name or address
+    that is already there is refused. The import failed - the entry just added is taken back. -> the add row."""
+    run = run or run_limited
+    fail = lambda why: {"state": "fail", "name": name, "at": now, "why": why}
+    if not ADD_NAME.fullmatch(name):
+        return fail(tr("add_bad_name"))
+    if not ADD_URL.fullmatch(url) or not safe_url(url):
+        return fail(tr("add_bad_url"))
+    have = {**catalog_servers(), **hub_servers(), **user_servers()}
+    if name.lower() in {n.lower() for n in have} or fingerprint({"url": url}) in {fingerprint(v) for v in have.values()}:
+        return fail(tr("add_exists"))
+    claude, hub = claude_cmd(), hub_bin()
+    if not claude:
+        return fail(tr("add_noclaude"))
+    if not hub:
+        return fail(tr("login_nohub"))
+    got = run(claude + ["mcp", "add", "--transport", "http", "-s", "user", name, url], ADD_RUN)
+    if got is None or got[0] != 0:
+        return fail(tr("add_claude_failed") + (": " + last_line(got[1]) if got and last_line(got[1]) else ""))
+    got = run([sys.executable, hub, "tools", "import", "mcp", name, "--about", human(name)], IMPORT_RUN)
+    if got is None or got[0] != 0:
+        run(claude + ["mcp", "remove", "-s", "user", name], ADD_RUN)   # the entry this click made, not the owner's
+        return fail(tr("add_hub_failed") + (": " + last_line(got[1]) if got and last_line(got[1]) else ""))
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: added", name, flush=True)
+    return {"state": "done", "name": name, "at": now}
+
+
+CLICK = re.compile(r"(login|reconnect|switch) (\S{1,128})|auto (on|off)|add (\S{1,64}) (\S{1,512})")
 
 
 def clicks(hub_st, after, now):
     """[(seq, act, arg)] - the owner's posts of the plugin channel after seq `after`, not older than LOGIN_FRESH:
-    "login <server>", "reconnect <server>", "switch <server>", "auto on|off"; the second item is the highest seq seen. Only the owner's
+    "login <server>", "reconnect <server>", "switch <server>", "add <name> <address>", "auto on|off"; the second item is the highest seq seen. Only the owner's
     word counts (a session posts there too)."""
     out, top = [], after
     for p in hub_st.get("feeds", {}).get(NAME) or []:
@@ -1651,7 +1716,8 @@ def clicks(hub_st, after, now):
         top = max(top, seq)
         m = CLICK.fullmatch(str(p.get("text") or "").strip())
         if p.get("by") == "owner" and m and now - float(p.get("ts") or 0) <= LOGIN_FRESH:
-            out.append((seq, "auto", m.group(3)) if m.group(3) else (seq, m.group(1), m.group(2)))
+            out.append((seq, "auto", m.group(3)) if m.group(3) else (seq, "add", (m.group(4), m.group(5))) if m.group(4)
+                       else (seq, m.group(1), m.group(2)))
     return out, top
 
 
@@ -1685,6 +1751,14 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
     switchable = {n for n, r in known.items() if r.get("can_switch")}
     checks = []
     for _, act, server in found:
+        if act == "add":
+            name, url = server
+            data["add"] = add_server(name, url, hub_st, now, run)   # one at a time: handled in this thread
+            if data["add"]["state"] == "done":
+                rows[name] = login_start(name, hub_st, now, run)
+                RECHECK_NOW.set()   # the new server joins the table at the next pass
+            changed = True
+            continue
         if act == "auto":
             st = load_state()
             st["auto"] = server == "on"
