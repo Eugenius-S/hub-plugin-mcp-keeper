@@ -1691,6 +1691,47 @@ class ConnectedWord(unittest.TestCase):
         self.assertIn("подключены {ok}", main.STR["ru"]["status"])
 
 
+class CatalogRules(unittest.TestCase):
+    """0.7.2: what the catalog of Flagman asks of a plugin - the README says what is read, written and sent (the switch
+    script and the terminal included), the manifest asks for the page and the process only, `hub` is not above the
+    Plugin API of the released core (1.30 in v1.5.1)."""
+
+    def readme(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_readme_names_what_is_read_written_and_sent(self):
+        src = self.readme()
+        self.assertIn("## What it reads, writes and sends", src)
+        for word in ("**Reads:**", "**Writes:**", "**Sends:**", "**Starts programs:**"):
+            self.assertIn(word, src)
+
+    def test_readme_names_the_switch_script_and_the_terminal(self):
+        src = self.readme()
+        for name in ("switch-<server>.cmd", "switch-<server>.command", "switch-<server>.sh", "switch-<сервер>.cmd"):
+            self.assertIn(name, src)
+        self.assertIn("terminal window", src)
+
+    def test_the_script_names_in_the_readme_are_the_ones_the_code_writes(self):
+        with open(os.path.join(ROOT, "main.py"), encoding="utf-8") as f:
+            code = f.read()
+        self.assertIn('"switch-" + safe + ".cmd"', code)
+        self.assertIn('".command" if sys.platform == "darwin" else ".sh"', code)
+
+    def test_the_manifest_asks_for_the_page_and_the_process_only(self):
+        with open(os.path.join(ROOT, "hub-plugin.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        rights = {"run", "web", "hooks", "mcp", "skills", "agents", "tools", "commands"} & set(man)
+        self.assertEqual(rights, {"run", "web"})
+        self.assertEqual(man["web"], "main.js")
+
+    def test_hub_is_not_above_the_released_plugin_api(self):
+        with open(os.path.join(ROOT, "hub-plugin.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        major, minor = man["hub"].lstrip("^>=~ ").split(".")[:2]
+        self.assertLessEqual((int(major), int(minor)), (1, 30))
+
+
 class Strings(unittest.TestCase):
     def test_same_keys_in_every_language(self):
         for lang in main.STR:

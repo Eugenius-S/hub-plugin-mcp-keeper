@@ -96,6 +96,33 @@ A user server in `~/.claude.json` with the address of a plugin's server hides th
 (the login under `plugin:...` is never refreshed). It touches only Claude Code outside the hub, so it is **off by
 default**; `check_duplicates: true` sends one line a day to the hub's developer session.
 
+## What it reads, writes and sends
+
+- **Reads:** `hub.json` (the MCP catalog, the plugin's own settings), the hub's state and journal (which sessions run,
+  what they report about each server), the stored MCP logins of Claude Code (the macOS keychain item or
+  `.credentials.json`; read only). With `cover` or `check_duplicates` also `~/.claude.json`, with `cover` also
+  `~/.mcp-auth`: read only.
+- **Writes:** only its own places. `status.json` next to the plugin (what the view shows), and in the plugin's own
+  folder of the hub state `state.json` (the pass state and your choice of automatic reconnect), `login.json` (the end of
+  a login you started from the view) and the switch script below. Events to the hub (a message to the owner, a line to
+  the feed, a reconnect request, a line to a session) go through the hub's spool folder, the way every plugin process
+  posts. It never writes the credential stores, `~/.claude.json`, `hub.json` or another plugin's files. A short log goes
+  to the process output, which the hub keeps in its own log.
+- **Sends:** a server's own address gets one `initialize` request with the stored token (https, or localhost; no
+  redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
+- **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
+  your click on **Log in**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
+  (a list of processes, to tell who holds a lost one-time login), and the terminal below. A `headersHelper` runs only
+  when the server's own catalog entry names it.
+- **A terminal window, on a click.** On **Connect another account** the process writes a script into its own state
+  folder: `switch-<server>.cmd` on Windows, `switch-<server>.command` on macOS, `switch-<server>.sh` on Linux (the
+  server name is cleaned to letters, digits and `._-`; shell characters in the hint are dropped). The script goes to the
+  login folder of that server and starts `claude` there, in a new terminal window that stays open. Only your own click
+  in the view starts it; nothing opens a window by itself. The script keeps no secret: a folder, a hint and the `claude`
+  command.
+
+The plugin asks for the page and the process, nothing more.
+
 ## What is stored
 
 Server names, states and times - nothing else. No command lines, arguments, headers, addresses or query strings: the
@@ -172,6 +199,14 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 этого сервера и подсказкой (`/mcp`, сервер, «Clear authentication», затем «Authenticate» и другой аккаунт в браузере).
 Сам плагин подключенный вход не переключает: хранилище входов Claude Code ему писать нельзя, а `claude mcp logout` стирает
 вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключенного только **Подключить другой**. Подробнее выше, в разделе про вид.
+
+Что плагин читает, пишет и куда шлёт: читает `hub.json`, состояние хаба и сохранённые входы MCP Claude Code (только
+чтение); пишет только в свои места (`status.json` рядом с плагином, `state.json`, `login.json` и скрипт ниже в своей папке
+состояния, события в хаб через его spool); входы Claude Code, `~/.claude.json` и `hub.json` не пишет; в сеть ходит только
+на собственный адрес сервера с сохранённым токеном. По клику **Подключить другой** процесс пишет скрипт
+`switch-<сервер>.cmd` (Windows), `.command` (macOS) или `.sh` (Linux) в свою папку состояния и открывает окно терминала с
+`claude` в папке входа этого сервера. Окно открывает только ваш клик, секретов в скрипте нет. Права плагина: страница и
+процесс.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 
