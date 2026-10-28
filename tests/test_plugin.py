@@ -1840,7 +1840,7 @@ class SwitchKinds(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.8.1")
+        self.assertEqual(m["version"], "0.8.2")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -2039,7 +2039,7 @@ class JsStrings(unittest.TestCase):
 
 
 class ConnectedWord(unittest.TestCase):
-    """0.7.2 (owner): the state of a working login is "connected" (ru: "подключен"), not "active"."""
+    """0.7.2 (owner): the state of a working login is "connected" (ru: "подключён"), not "active"."""
 
     def test_no_active_word_in_what_the_owner_reads(self):
         import re
@@ -2053,8 +2053,8 @@ class ConnectedWord(unittest.TestCase):
             src = f.read()
         self.assertIn('ok: "connected"', src)
         self.assertIn('ok_at: "Last connected"', src)
-        self.assertIn('ok: "подключен"', src)
-        self.assertIn("Последний раз подключен", src)
+        self.assertIn('ok: "подключён"', src)
+        self.assertIn("Последний раз подключён", src)
         self.assertIn("подключены {ok}", main.STR["ru"]["status"])
 
 

@@ -1,13 +1,13 @@
 {
   "name": "mcp-keeper",
   "icon": "icon.png",
-  "description": "Every 15 minutes checks the logins (OAuth and API keys) of the MCP servers the hub gives to sessions and warns the owner once, before a lost login stops work. The view lists each server by name: connected or lost, when it was last connected; buttons Another login, Reconnect, Log in.",
-  "why": "A lost MCP login is found by the owner, not by a stuck session: the plugin notices it within 15 minutes and says how to log in, once",
-  "version": "0.8.1",
+  "description": "Finds a lost login to a service connected to your agents before the work stops, and warns you once. Checks every 15 minutes. The tab lists each service: connected or lost, and when it was last connected. Buttons: Another login, Reconnect, Log in.",
+  "why": "You hear about a lost login from the plugin, not from stalled work: within 15 minutes, once, with a hint how to log in",
+  "version": "0.8.2",
   "i18n": {
     "ru": {
-      "description": "Раз в 15 минут проверяет входы (OAuth и ключи) MCP-серверов, которые хаб выдаёт сессиям, и один раз предупреждает владельца, пока слетевший вход не остановил работу. Вид показывает серверы по имени: подключен или отвалился, когда был подключен; кнопки «Другой логин», «Переподключить», «Войти».",
-      "why": "Слетевший вход MCP находит плагин, а не вставшая сессия: через 15 минут владелец один раз узнаёт, что слетело и как войти"
+      "description": "Находит слетевший вход в сервис, подключённый к агентам, раньше, чем встанет работа, и один раз предупреждает вас. Проверяет раз в 15 минут. Вкладка показывает каждый сервис: подключён или отвалился, когда был подключён. Кнопки: «Другой логин», «Переподключить», «Войти».",
+      "why": "О слетевшем входе вы узнаёте от плагина, а не от вставшей работы: в течение 15 минут, один раз, с подсказкой, как войти"
     }
   },
   "hub": "^1.15",
