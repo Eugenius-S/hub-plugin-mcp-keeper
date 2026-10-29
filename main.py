@@ -72,6 +72,7 @@ STALE_DAYS = 2            # an access expired this long that Claude Code cannot 
 LOCK_FRESH = 300          # a refresh lock of Claude Code younger than this: someone is refreshing right now
 MAX_WAIT = 1800
 LOGIN_POLL = 5            # seconds between looks at the plugin channel for a click on "Log in"
+FRESH_EVERY = 30          # seconds between looks for a server that appeared since the last pass
 LOGIN_FRESH = 600         # a click older than this is not run (the process was down)
 LOGIN_LIVE = 360          # a login that waits longer has ended (the hub waits 300 s for the owner)
 LOGIN_RUN = 75            # the `hub mcp login` command itself (it returns once the link is open) - limit, seconds
@@ -140,7 +141,6 @@ STR = {
         "fix_mcp": "/mcp in Claude Code -> {name}",
         "first_line_fix": "\u2022 {name}: {fix}",
         "why_local": "a server on this machine: no login",
-        "why_open": "the server answers without a login",
         "why_program": "a program with its own login: not started, not checked",
         "why_ms365": "a program with its own login: auth-keeper checks it (--verify-login)",
         "why_read_only": "the access lives 15 minutes; the hub's conduit module refreshes it when it is used - only looked at",
@@ -159,6 +159,7 @@ STR = {
         "add_noclaude": "Claude Code was not found",
         "add_claude_failed": "Claude Code did not add the server",
         "add_hub_failed": "the hub did not take the server",
+        "add_hub_busy": "the hub was busy and did not take the server: try again",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает: хаб освежит его, когда сессия "
@@ -204,7 +205,6 @@ STR = {
         "fix_mcp": "/mcp в Claude Code -> {name}",
         "first_line_fix": "\u2022 {name}: {fix}",
         "why_local": "сервер на этой машине: входа нет",
-        "why_open": "сервер отвечает без входа",
         "why_program": "программа со своим входом: не запускается, не проверяется",
         "why_ms365": "программа со своим входом: её проверяет auth-keeper (--verify-login)",
         "why_read_only": "доступ живёт 15 минут, его освежает модуль conduit хаба при использовании, мы только смотрим",
@@ -223,6 +223,7 @@ STR = {
         "add_noclaude": "Claude Code не найден",
         "add_claude_failed": "Claude Code не добавил сервер",
         "add_hub_failed": "хаб не принял сервер",
+        "add_hub_busy": "хаб был занят и не принял сервер: попробуй ещё раз",
     },
 }
 
@@ -1017,7 +1018,7 @@ def checkup(conf, now, st, hub, hub_st, only=None):
                 out[name] = {"state": "first", "why": tr("why_first"), "fix": fix, "by": by}
             elif cover and url:   # every server of the machine: one that needs no login, or one never logged in
                 ok = probe_open(url)
-                out[name] = ({"state": "skip", "why": tr("why_open"), "by": "none"} if ok
+                out[name] = ({"state": "ok", "by": "none"} if ok   # answers an initialize without a login: connected, nothing to press
                              else {"state": "first", "why": tr("why_first"), "fix": fix, "by": by} if ok is False
                              else {"state": "later", "by": by})
             continue   # never logged in and nobody waits: a login nobody made is no loss
@@ -1659,12 +1660,21 @@ ADD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 ADD_URL = re.compile(r"https?://[A-Za-z0-9.\[\]:-]{1,200}(?:/[A-Za-z0-9._~%+/-]{0,200})?")   # no login, query or fragment: a key hides there
 ADD_RUN = 60              # `claude mcp add` - limit, seconds
 IMPORT_RUN = 40           # `hub tools import mcp` - limit, seconds
+IMPORT_TRIES = 4          # the hub's settings file is written by another process in that minute: the import is tried again
+IMPORT_PAUSE = 5          # seconds between those tries
+BUSY = re.compile(r"PermissionError|WinError (?:5|32)|Access is denied|used by another process|Permission denied|EBUSY|"
+                  r"resource busy|locked", re.I)
 ADD_SHOW = 3600           # the result of an add stays under the table this long
 
 
 def last_line(out, size=160):
     lines = [x.strip() for x in str(out).splitlines() if x.strip() and "://" not in x]
     return lines[-1][:size] if lines else ""
+
+
+def in_catalog(url):
+    """Is a server with this address in the hub catalog (hub.json) - the import is done, whoever did it."""
+    return fingerprint({"url": url}) in {fingerprint(v) for v in catalog_servers().values()}
 
 
 def add_server(name, url, hub_st, now, run=None):
@@ -1690,9 +1700,22 @@ def add_server(name, url, hub_st, now, run=None):
     got = run(claude + ["mcp", "add", "--transport", "http", "-s", "user", name, url], ADD_RUN)
     if got is None or got[0] != 0:
         return fail(tr("add_claude_failed") + (": " + last_line(got[1]) if got and last_line(got[1]) else ""))
-    got = run([sys.executable, hub, "tools", "import", "mcp", name, "--about", human(name)], IMPORT_RUN)
-    if got is None or got[0] != 0:
+    busy = False
+    for i in range(IMPORT_TRIES):
+        got = run([sys.executable, hub, "tools", "import", "mcp", name, "--about", human(name)], IMPORT_RUN)
+        if got is not None and got[0] == 0 or in_catalog(url):   # taken, or the hub itself put it there meanwhile
+            break
+        busy = bool(got) and bool(BUSY.search(str(got[1])))
+        if not busy:
+            break
+        if i < IMPORT_TRIES - 1:
+            time.sleep(IMPORT_PAUSE)
+    else:
+        got = None
+    if not (got is not None and got[0] == 0 or in_catalog(url)):
         run(claude + ["mcp", "remove", "-s", "user", name], ADD_RUN)   # the entry this click made, not the owner's
+        if busy:
+            return fail(tr("add_hub_busy"))
         return fail(tr("add_hub_failed") + (": " + last_line(got[1]) if got and last_line(got[1]) else ""))
     print(time.strftime("%H:%M:%S"), "mcp-keeper: added", name, flush=True)
     return {"state": "done", "name": name, "at": now}
@@ -1755,7 +1778,8 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
             name, url = server
             data["add"] = add_server(name, url, hub_st, now, run)   # one at a time: handled in this thread
             if data["add"]["state"] == "done":
-                rows[name] = login_start(name, hub_st, now, run)
+                if probe_open(url) is not True:   # one that answers without a login has nothing to log in to
+                    rows[name] = login_start(name, hub_st, now, run)
                 RECHECK_NOW.set()   # the new server joins the table at the next pass
             changed = True
             continue
@@ -1836,10 +1860,50 @@ def recheck(server):
         print(time.strftime("%H:%M:%S"), "mcp-keeper: reconnect:", type(e).__name__, flush=True)
 
 
+def fresh_step():
+    """A server that appeared after the last pass (the hub, a session or the owner added it to the catalog,
+    ~/.claude.json or a plugin) gets its row now, not at the next pass: only the new names are checked, once each.
+    Not while a pass runs. True - the view changed."""
+    if not LOCK.acquire(blocking=False):
+        return False
+    try:
+        st = load_state()
+        rows = (st.get("status") or {}).get("servers")
+        if not isinstance(rows, dict):
+            return False   # no table yet: the first pass writes it
+        conf, hub_st = settings(), hub_state()
+        seen = set(st.get("fresh_seen") or [])
+        here = served(hub_st, conf.get("cover"))
+        new = {n for n in here if n not in rows and n not in seen and not ignored(n, conf["ignore"])}
+        if not new:
+            return False
+        st["fresh_seen"] = sorted((seen | new) & set(here))   # asked once; a server that went away is forgotten
+        hub, now = hub_session(hub_st), time.time()
+        res = settle(checkup(conf, now, st, hub, hub_st, only=new), conf, now, st, hub, hub_st)
+        ok_at = st.setdefault("ok_at", {})
+        for n, s in res["servers"].items():
+            if s["state"] == "ok":
+                ok_at[n] = now
+            rows[n] = view_row(n, s, ok_at, res.get("logged") or ())
+        st["had"] = sorted(set(st.get("had") or []) |
+                           {n for n in res.get("logged") or () if res["servers"].get(n, {}).get("state") == "ok"})
+        st["auto"] = load_state().get("auto", st.get("auto", True))
+        save_state(st)
+        write_status(st)
+        print(time.strftime("%H:%M:%S"), "mcp-keeper: new:", ", ".join(sorted(res["servers"])) or "-", flush=True)
+        return True
+    finally:
+        LOCK.release()
+
+
 def login_watch():
+    fresh_at = 0.0
     while True:
         try:
             login_step()
+            if time.time() - fresh_at >= FRESH_EVERY:
+                fresh_at = time.time()
+                fresh_step()
         except Exception as e:   # noqa: BLE001 - the view's button must not take the checking down
             print(time.strftime("%H:%M:%S"), "mcp-keeper: login:", type(e).__name__, flush=True)
         time.sleep(LOGIN_POLL)

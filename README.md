@@ -73,7 +73,8 @@ the watch from what the hub gives its sessions to every MCP server of this machi
 | stdio with `mcp-remote <url>` | its stored login in `~/.mcp-auth` (read only, never exchanged), live access - `initialize` | `auth-keeper` when that plugin is on, else `mcp-remote` |
 | Microsoft 365 program | skipped: auth-keeper runs its `--verify-login` | `auth-keeper` |
 | any other stdio program | skipped, never started; the reason is in `status.json` | `program` |
-| a server on this machine (localhost) / one that answers without a login | skipped | `local` / `none` |
+| a server on this machine (localhost) | skipped | `local` |
+| one that answers without a login | connected, no **Log in** | `none` |
 
 `mcp_auth_ignore` and `ignore` hold. A server under a second name (the same address or package) is checked once.
 
@@ -135,9 +136,13 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
   counts, once). The process then does what you would type: `claude mcp add --transport http -s user <name> <address>`,
   then `hub tools import mcp <name>`, then `hub mcp login` for the browser login, the same as **Log in**. A name or an
   address that is already in the hub catalog, in the hub settings or in `~/.claude.json` is refused with the reason,
-  nothing is run. If the hub refuses the entry, `claude mcp remove` takes it back. No key or token is typed, read or
+  nothing is run. If the hub's settings file is busy (another process writes it), the import is tried again up to 4
+  times, 5 seconds apart; if the server is in the hub catalog by then, the add counts as done. If the hub still refuses
+  the entry, `claude mcp remove` takes it back. A server that answers without a login gets no browser login. No key or token is typed, read or
   written: the login happens in the browser, in Claude Code's own store. The address is not kept in `status.json` or
   `login.json`; they hold the name, the result and a short reason. Sessions get the new server after they restart.
+  A server that appears in the hub catalog, `~/.claude.json` or a plugin by other means gets its row in the view within
+  about 30 seconds, not at the next pass (the same files are read, one check per new name).
 
 The plugin asks for the page and the process, nothing more.
 
@@ -244,9 +249,12 @@ add` добавляет сервер в `~/.claude.json`, `hub tools import mcp`
 <адрес>` (считается только ваш свежий пост, один раз). Процесс делает то же, что набрали бы вы: `claude mcp add --transport
 http -s user`, затем `hub tools import mcp`, затем `hub mcp login` для входа в браузере, как у кнопки **Войти**. Название или
 адрес, которые уже есть в каталоге хаба, настройках хаба или `~/.claude.json`, отклоняются с причиной, ничего не
-запускается. Если хаб не принял запись, `claude mcp remove` её убирает. Ключ не вводится, не читается и не пишется: вход в
+запускается. Если файл настроек хаба занят (его пишет другой процесс), импорт повторяется до 4 раз с паузой 5 секунд; если
+к этому времени сервер уже в каталоге хаба, добавление считается сделанным. Если хаб всё же не принял запись, `claude mcp remove` её
+убирает. Сервер, который отвечает без входа, в браузер за входом не отправляется. Ключ не вводится, не читается и не пишется: вход в
 браузере, в хранилище самого Claude Code. Адрес в `status.json` и `login.json` не хранится. Сессии получают сервер после
-перезапуска. Права плагина: страница и процесс.
+перезапуска. Сервер, который появился в каталоге хаба, `~/.claude.json` или плагине другим путём, получает строку в виде
+секунд через 30, а не на следующем проходе (читаются те же файлы, одна проверка на новое имя). Права плагина: страница и процесс.
 
 Icon: [3D Fluency](https://icons8.com/icons/3d-fluency) by Icons8.
 

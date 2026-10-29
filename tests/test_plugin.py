@@ -1015,13 +1015,53 @@ class Cover(Base):
         self.gate()
         s = self.run_once()["servers"]
         got = {n: (s[n]["state"], s[n].get("by")) for n in ("gate", "docs", "desk", "rem", "m365", "cli", "figma")}
-        self.assertEqual(got, {"gate": ("ok", "claude"), "docs": ("skip", "none"), "desk": ("skip", "local"),
+        self.assertEqual(got, {"gate": ("ok", "claude"), "docs": ("ok", "none"), "desk": ("skip", "local"),
                                "rem": ("ok", "mcp-remote"), "m365": ("skip", "program"), "cli": ("skip", "program"),
                                "figma": ("ok", "claude")})
-        self.assertTrue(all(s[n].get("why") for n in ("docs", "desk", "m365", "cli")))
+        self.assertTrue(all(s[n].get("why") for n in ("desk", "m365", "cli")))
         status = read(os.environ["MCP_KEEPER_STATUS"])
         self.assertEqual(status["servers"]["cli"]["state"], "skip")
         self.assertEqual(status["servers"]["rem"]["by"], "mcp-remote")
+
+    def test_a_server_that_needs_no_login_is_connected_with_nothing_to_press(self):
+        self.run_once()
+        docs = read(os.environ["MCP_KEEPER_STATUS"])["servers"]["docs"]
+        self.assertEqual(docs["state"], "ok")
+        self.assertNotIn("can_login", docs)
+        self.assertNotIn("why", docs)
+        self.assertEqual(self.notes(), [])
+        self.assertFalse([m for m in self.dev() if "docs" in m["text"]])
+
+    def add_user_server(self, name, url):
+        path = os.path.join(TMP, "claude", ".claude.json")
+        cj = read(path)
+        cj["mcpServers"][name] = {"type": "http", "url": url}
+        write(path, cj)
+
+    def test_a_server_that_appeared_gets_its_row_at_once_not_at_the_next_pass(self):
+        self.assertFalse(main.fresh_step(), "no table yet: the first pass writes it")
+        self.run_once()
+        self.assertFalse(main.fresh_step())
+        self.add_user_server("newsvc", "https://new.example/mcp")
+        self.open["https://new.example/mcp"] = True
+        self.assertTrue(main.fresh_step())
+        rows = read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+        self.assertEqual(rows["newsvc"]["state"], "ok")
+        self.assertIn("docs", rows)
+        self.assertFalse(main.fresh_step(), "the same server is not asked again")
+
+    def test_a_server_that_appeared_is_not_looked_at_while_a_pass_runs(self):
+        self.run_once()
+        self.add_user_server("newsvc", "https://new.example/mcp")
+        with main.LOCK:
+            self.assertFalse(main.fresh_step())
+        self.assertTrue(main.fresh_step(), "it is looked at once the pass is over")
+
+    def test_an_ignored_server_that_appeared_is_not_looked_at(self):
+        self.on(ignore=["newsvc"])
+        self.run_once()
+        self.add_user_server("newsvc", "https://new.example/mcp")
+        self.assertFalse(main.fresh_step())
 
     def test_a_list_of_machines(self):
         with mock.patch.object(main.socket, "gethostname", lambda: "Other-Box.local"):
@@ -1284,6 +1324,7 @@ class ViewAdd(Base):
         for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
                   mock.patch.object(main, "claude_cmd", lambda: ["/bin/claude"]),
                   mock.patch.object(main, "login_result", lambda server: self.login_done),
+                  mock.patch.object(main, "probe_open", lambda url: None),   # the network is closed
                   mock.patch.object(main, "run_limited", self.fake_run)):
             p.start()
             self.addCleanup(p.stop)
@@ -1292,7 +1333,10 @@ class ViewAdd(Base):
 
     def fake_run(self, cmd, timeout, merge=True):
         self.ran.append(cmd)
-        return self.answers.get(self.kind(cmd), (0, "ok\n"))
+        got = self.answers.get(self.kind(cmd), (0, "ok\n"))
+        if isinstance(got, list):
+            return got.pop(0) if len(got) > 1 else got[0]
+        return got() if callable(got) else got
 
     @staticmethod
     def kind(cmd):
@@ -1376,6 +1420,45 @@ class ViewAdd(Base):
         self.assertEqual(got["why"], "the hub did not take the server: no such server")
         self.assertEqual(self.kinds(), ["add", "import", "remove"])
         self.assertEqual(self.ran[-1], ["/bin/claude", "mcp", "remove", "-s", "user", "svc"])
+
+    BUSY = (1, "PermissionError: [WinError 5] Access is denied: 'hub.json.tmp' -> 'hub.json'\n")
+
+    def test_a_busy_settings_file_is_retried_and_the_entry_stays(self):
+        self.answers["import"] = [self.BUSY, self.BUSY, (0, "ok\n")]
+        got = main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual((got["state"], got["name"]), ("done", "svc"))
+        self.assertEqual(self.kinds(), ["add", "import", "import", "import"])
+
+    def test_busy_and_the_address_already_in_the_catalog_is_a_success(self):
+        def hub_took_it():   # another process (the hub itself) imported the same server in that minute
+            cfg = read(os.environ["HUB_CONFIG"])
+            cfg["mcp"]["svc"] = {"server": {"type": "http", "url": self.GOOD}}
+            write(os.environ["HUB_CONFIG"], cfg)
+            return self.BUSY
+        self.answers["import"] = hub_took_it
+        got = main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual(got["state"], "done")
+        self.assertEqual(self.kinds(), ["add", "import"])
+
+    def test_a_busy_file_that_stays_busy_says_so_and_takes_the_entry_back(self):
+        self.answers["import"] = self.BUSY
+        got = main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual((got["state"], got["why"]), ("fail", "the hub was busy and did not take the server: try again"))
+        self.assertEqual(self.kinds(), ["add"] + ["import"] * main.IMPORT_TRIES + ["remove"])
+
+    def test_a_refusal_that_is_not_a_busy_file_is_not_retried(self):
+        self.answers["import"] = (1, "no such server\n")
+        main.add_server("svc", self.GOOD, self.hub, NOW)
+        self.assertEqual(self.kinds().count("import"), 1)
+
+    def test_a_server_that_needs_no_login_is_not_sent_to_the_login(self):
+        with mock.patch.object(main, "probe_open", lambda url: True):
+            self.post(1, "add newsvc " + self.GOOD)
+            main.login_step(NOW + 1)
+        self.assertEqual(self.kinds(), ["add", "import"])
+        add = self.status()["add"]
+        self.assertEqual((add["state"], add["name"]), ("done", "newsvc"))
+        self.assertNotIn("login", add)
 
     def test_no_claude_and_no_hub_are_fails_not_crashes(self):
         with mock.patch.object(main, "claude_cmd", lambda: None):
@@ -1840,7 +1923,7 @@ class SwitchKinds(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.8.2")
+        self.assertEqual(m["version"], "0.9.0")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
