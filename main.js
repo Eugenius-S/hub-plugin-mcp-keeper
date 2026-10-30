@@ -14,7 +14,7 @@ const STR = {
     auto_hint: "a lost server reconnects in the running sessions by itself, at most once in 10 min",
     switch: "Another login", no_account: "no account", switch_sent: "opening a terminal…",
     switch_done: "terminal opened: follow the steps in it", switch_fail: "the terminal did not open",
-    ignored: "Not followed",
+    ignored: "Not followed", core_login: "waits for a login: the button is in the hub's strip",
     add: "Add MCP", add_name: "Name", add_url: "Address, https://…", add_go: "Add", add_cancel: "Cancel",
     add_hint: "The service gives the name and the address. A key is not typed here: you log in in the browser.",
     add_bad: "Check the name (letters, digits, - and _) and the address (https, no key or parameters in it)",
@@ -33,7 +33,7 @@ const STR = {
     auto_hint: "отвалившийся сервер сам переподключается в работающих сессиях, не чаще раза в 10 мин",
     switch: "Другой логин", no_account: "без аккаунта", switch_sent: "открываю терминал…",
     switch_done: "терминал открыт: дальше по шагам в нём", switch_fail: "терминал не открылся",
-    ignored: "Не следим",
+    ignored: "Не следим", core_login: "ждёт входа — кнопка в полосе хаба",
     add: "Добавить MCP", add_name: "Название", add_url: "Адрес, https://…", add_go: "Добавить", add_cancel: "Отмена",
     add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь в браузере.",
     add_bad: "Проверь название (буквы, цифры, - и _) и адрес (https, без ключа и параметров)",
@@ -44,7 +44,7 @@ const ORDER = { lost: 0, first: 1, ok: 3, skip: 4 };
 const COLOR = { lost: "#e5484d", first: "#f5a524", ok: "#30a46c", skip: "#8b8d98" };
 
 let hub;
-let last = { id: 0, at: 0, data: null };
+let last = { id: 0, at: 0, data: null, snap: null };
 const sent = {};   // server -> {at, act}: the row says what was asked until the process answers
 const SENT_FOR = 20000;
 const form = { open: false, name: "", url: "", bad: false, at: 0, focus: "" };   // "Add MCP": what is typed survives a redraw
@@ -77,13 +77,27 @@ function adding() {
 }
 
 async function load(snap, force = false) {
+  const before = [...(coreWaits(last.snap) || [])].sort().join("\n");
+  if (snap) last.snap = snap;
+  const moved = before !== [...(coreWaits(last.snap) || [])].sort().join("\n");
   const top = Number((snap && snap.feeds && snap.feeds[NAME]) || last.id);
-  if (!force && last.data && top === last.id && Date.now() - last.at < (waiting() ? 4000 : 60000)) return false;
+  if (!force && last.data && top === last.id && Date.now() - last.at < (waiting() ? 4000 : 60000)) return moved;
   const r = await fetch(new URL("status.json", import.meta.url), { cache: "no-store" });
   const data = r.ok ? await r.json() : null;
-  const changed = JSON.stringify(data) !== JSON.stringify(last.data);
-  last = { id: top, at: Date.now(), data: data && typeof data.servers === "object" ? data : null };
+  const changed = moved || JSON.stringify(data) !== JSON.stringify(last.data);
+  last = { id: top, at: Date.now(), data: data && typeof data.servers === "object" ? data : null, snap: last.snap };
   return changed;
+}
+
+// A core that has its own "MCP waits for a login" strip (Plugin API 1.31) puts mcp_waits in the snapshot; an older one
+// has no such key, and the view works as before. A server in that list is signed in through the strip: no "Log in" here.
+function coreWaits(snap) {
+  return snap && Array.isArray(snap.mcp_waits) ? new Set(snap.mcp_waits.map((w) => w && w.server)) : null;
+}
+
+function coreWaiting(name, s) {
+  const w = coreWaits(last.snap);
+  return w ? w.has(name) : !!s.core_wait;
 }
 
 function mine(name, act) {
@@ -137,7 +151,13 @@ function actionCell(row, name, s) {
   bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
   if (s.can_switch) bar.append(button("mk-switch", "switch", "switch_sent", name, "switch", td));
   else if (s.state !== "skip" && s.state !== "ok") bar.append(button("mk-reconnect", "reconnect", "reconnect_sent", name, "reconnect", td));
-  if (s.can_login && s.state !== "ok") bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
+  const core = s.state !== "ok" && s.state !== "skip" && coreWaiting(name, s);   // the hub's strip has this login
+  if (s.can_login && s.state !== "ok" && !core) bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
+  if (core) {
+    const hint = hub.el("span", "mk-core", tr("core_login"));
+    hint.style.cssText = "opacity:.7;font-size:.9em;align-self:center";
+    bar.append(hint);
+  }
   if (bar.firstChild) td.append(bar);
   else if (s.no_account) {
     const grey = hub.el("span", "mk-noacc", tr("no_account"));

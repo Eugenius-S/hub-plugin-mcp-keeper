@@ -150,6 +150,7 @@ STR = {
         "dev": "MCP: first sign of a lost login (the owner hears only if it stays lost for {passes} more passes):",
         "dev_line": "\u2022 {name} ({by}) - {why}: {fix}",
         "login_unknown": "no login from this view for this server",
+        "login_core": "the hub handles this login itself: the button is in its strip",
         "reconnect_unknown": "the hub does not give this server to sessions",
         "login_nohub": "the hub command was not found",
         "login_failed": "the login did not go through (code {code})",
@@ -214,6 +215,7 @@ STR = {
         "dev": "MCP: первый признак слёта входа (владелец узнает, только если не оживёт ещё {passes} прохода):",
         "dev_line": "\u2022 {name} ({by}), {why}: {fix}",
         "login_unknown": "для этого сервера вход отсюда не запускается",
+        "login_core": "этот вход ведёт сам хаб: кнопка в его полосе",
         "reconnect_unknown": "хаб не выдаёт этот сервер сессиям",
         "login_nohub": "команда hub не найдена",
         "login_failed": "вход не прошёл (код {code})",
@@ -931,6 +933,30 @@ def hub_state():
         return {"sessions": {}}
 
 
+def core_view(hub_st):
+    """What the core of the hub already handles itself (Flagman 1.6: the "MCP waits for a login" strip, its own sign-in).
+    None - an older core, nothing is handled for us, the plugin works as before. Else {"waits": servers some live
+    session waits on, "logins": servers with a sign-in of the core under way}. The sign is the function itself, not a
+    key of the state: the key is absent while nobody waits."""
+    try:
+        from core import mcpwatch
+        if not hasattr(mcpwatch, "view"):
+            return None
+        waits = {r["server"] for r in mcpwatch.view(hub_st)}
+        active = tuple(getattr(mcpwatch, "ACTIVE", ("asked", "open", "sent")))
+        logins = {a.get("server") for a in (hub_st.get("mcp_logins") or {}).values()
+                  if isinstance(a, dict) and a.get("state") in active}
+        return {"waits": waits, "logins": logins - {None}}
+    except Exception:   # noqa: BLE001 - a state the core view cannot read: as an older core, the old way
+        return None
+
+
+def core_busy(hub_st):
+    """Servers the core handles now (strip + sign-in), to be left to it: no alarm, no reconnect, no login of ours."""
+    v = core_view(hub_st)
+    return (v["waits"] | v["logins"]) if v else set()
+
+
 def hub_session(st):
     """Name of the hub session (`hub mcp login` needs an existing session)."""
     return next((n for n, s in (st.get("sessions") or {}).items()
@@ -1470,7 +1496,7 @@ def account_kind(srv, logged):
     return "none" if srv.get("url") else None
 
 
-def view_row(n, s, ok_at, logged=(), servers=None):
+def view_row(n, s, ok_at, logged=(), servers=None, core=()):
     """One row of the view: the state, the name for a person (title), what can be pressed. can_switch - a connected
     server with an account: another one can be connected (a terminal, see open_terminal, what it runs depends on the
     kind - `account`); no_account - a server without any: nothing to switch, the row says why."""
@@ -1479,17 +1505,19 @@ def view_row(n, s, ok_at, logged=(), servers=None):
         kind = account_kind((cover_servers() if servers is None else servers).get(n), n in logged)
     return {"state": s["state"], "ok_at": ok_at.get(n), "title": human(n),
             **({"why": s["why"]} if s.get("why") else {}), **({"by": s["by"]} if s.get("by") else {}),
-            **({"can_login": True} if s["state"] in ("lost", "first") and
+            **({"core_wait": True} if n in core and s["state"] in ("lost", "first") else {}),
+            **({"can_login": True} if s["state"] in ("lost", "first") and n not in core and
                str(s.get("fix") or "").startswith("hub mcp login ") else {}),
             **({"can_switch": True, "account": kind} if s["state"] == "ok" and kind in ACCOUNTS else {}),
             **({"no_account": True} if kind == "none" else {}),
             **({"ignored": True} if s.get("ignored") else {})}
 
 
-def post_status(st, res, conf, now):
+def post_status(st, res, conf, now, hub_st=None):
     """Rows for the view (status.json) every pass; one human line to the plugin channel when the picture changed."""
     ok_at = st.setdefault("ok_at", {})
-    rows = {n: view_row(n, s, ok_at, res.get("logged") or ()) for n, s in sorted(res["servers"].items())}
+    core = core_busy(hub_st if hub_st is not None else hub_state())
+    rows = {n: view_row(n, s, ok_at, res.get("logged") or (), core=core) for n, s in sorted(res["servers"].items())}
     st["status"] = {"v": 1, "at": now, "every": conf["every"] / 60, "auto": st.get("auto", True) is not False,
                     "servers": rows}
     write_status(st)
@@ -1800,7 +1828,8 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
         data["seen"] = top
         changed = True
     known = (load_state().get("status") or {}).get("servers") or {}
-    can = {n for n, r in known.items() if r.get("can_login")}
+    core = core_busy(hub_st)   # a server the core handles itself (strip, sign-in): its login is not ours to start
+    can = {n for n, r in known.items() if r.get("can_login")} - core
     switchable = {n for n, r in known.items() if r.get("can_switch")}
     checks = []
     for _, act, server in found:
@@ -1808,7 +1837,9 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
             name, url = server
             data["add"] = add_server(name, url, hub_st, now, run)   # one at a time: handled in this thread
             if data["add"]["state"] == "done":
-                if probe_open(url) is not True:   # one that answers without a login has nothing to log in to
+                if name in core:
+                    rows[name] = {"state": "fail", "at": now, "why": tr("login_core")}
+                elif probe_open(url) is not True:   # one that answers without a login has nothing to log in to
                     rows[name] = login_start(name, hub_st, now, run)
                 RECHECK_NOW.set()   # the new server joins the table at the next pass
             changed = True
@@ -1839,7 +1870,9 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
             continue
         if (rows.get(server) or {}).get("state") == "wait":
             continue   # one is open already: the click does not start a second
-        if server not in can:
+        if server in core:
+            rows[server] = {"state": "fail", "at": now, "why": tr("login_core")}
+        elif server not in can:
             rows[server] = {"state": "fail", "at": now, "why": tr("login_unknown")}
         else:
             rows[server] = login_start(server, hub_st, now, run)
@@ -1875,7 +1908,8 @@ def recheck(server):
             if s and server in rows:
                 if s["state"] == "ok":
                     st.setdefault("ok_at", {})[server] = now
-                rows[server] = view_row(server, s, st.get("ok_at") or {}, res.get("logged") or ())
+                rows[server] = view_row(server, s, st.get("ok_at") or {}, res.get("logged") or (),
+                                        core=core_busy(hub_st))
             st["auto"] = load_state().get("auto", st.get("auto", True))
             save_state(st)
             data = read_json(login_path()) or {}
@@ -1910,11 +1944,11 @@ def fresh_step():
         st["fresh_seen"] = sorted((seen | new) & set(here))   # asked once; a server that went away is forgotten
         hub, now = hub_session(hub_st), time.time()
         res = settle(checkup(conf, now, st, hub, hub_st, only=new), conf, now, st, hub, hub_st)
-        ok_at = st.setdefault("ok_at", {})
+        ok_at, core = st.setdefault("ok_at", {}), core_busy(hub_st)
         for n, s in res["servers"].items():
             if s["state"] == "ok":
                 ok_at[n] = now
-            rows[n] = view_row(n, s, ok_at, res.get("logged") or ())
+            rows[n] = view_row(n, s, ok_at, res.get("logged") or (), core=core)
         st["had"] = sorted(set(st.get("had") or []) |
                            {n for n in res.get("logged") or () if res["servers"].get(n, {}).get("state") == "ok"})
         st["auto"] = load_state().get("auto", st.get("auto", True))
@@ -1968,14 +2002,15 @@ def one_pass(now=None):
     # an alarm rests only on a clear answer, and never on a server that is only looked at
     bad = {n: s for n, s in lost(res).items() if not s.get("unclear") and not looked_at(n, conf)}
     st["auto"] = load_state().get("auto", st.get("auto", True))   # the owner may have switched it during the pass
+    core = core_busy(hub_st)   # what the core's strip and sign-in handle: no reconnect, no alarm, no login of ours
     if st["auto"]:
-        res["reconnected"] = auto_step(st, sorted(lost(res)), now, conf)
+        res["reconnected"] = auto_step(st, sorted(n for n in lost(res) if n not in core), now, conf)
     put(f"ext.{NAME}.checked", {"ok": sorted(n for n, s in servers.items() if s["state"] == "ok"),
                                 "lost": [{"name": n, "why": s.get("why")} for n, s in sorted(bad.items())],
                                 "unclear": sorted(n for n, s in servers.items() if s.get("unclear")),
                                 "skip": sorted(n for n, s in servers.items() if s["state"] == "skip"),
                                 "dups": res["dups"]})
-    post_status(st, res, conf, now)
+    post_status(st, res, conf, now, hub_st)
     al = st.setdefault("alarms", {})
     for n in bad:   # a one-time login lost: who was running then - for finding the cause later
         if short(n) in conf["one_time"] and not al.get(n, {}).get("open"):
@@ -1992,9 +2027,10 @@ def one_pass(now=None):
                 a["open"], a["at"] = False, 0
         st["hushed"] = conf["quiet_until"]
     use = in_use(hub_st)
-    owner_bad = bad
+    told_bad = {n: s for n, s in bad.items() if n not in core}   # the core says it itself for these: not told twice
+    owner_bad = told_bad
     if conf["cover"]:   # the Hub Developer at the first sign, the owner only when it stays lost
-        owner_bad = ladder(st, servers, bad, conf, now, hub_st, res)
+        owner_bad = ladder(st, servers, told_bad, conf, now, hub_st, res)
     names, resolve = alarms_step(st, servers, owner_bad, conf, now, hold)
     if names:   # the owner - only a login that worked and stopped: one urgent message, the most important first
         put("owner.notify", {"id": NOTE_ID, "title": tr("title"), "topic": tr("lost_topic"),
@@ -2008,7 +2044,7 @@ def one_pass(now=None):
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"], "text": message({}, res["dups"], conf, use, ok_at)})
     # never logged in is no loss (owner 22.10): one line a day to the Hub Developer, who asks the owner for one login
-    first = sorted(n for n, s in servers.items() if s["state"] == "first")
+    first = sorted(n for n, s in servers.items() if s["state"] == "first" and n not in core)   # the core's strip has its own
     if remember(st, "told_never", first, now, set()) == "tell":
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"], "text": "\n".join(
@@ -2074,8 +2110,10 @@ def start_auto():
     if st.get("auto", True) is False:
         return
     rows = (st.get("status") or {}).get("servers") or {}
+    core = core_busy(hub_state())
     with LOCK:
-        if auto_step(st, sorted(n for n, r in rows.items() if r.get("state") == "lost"), time.time(), settings()):
+        if auto_step(st, sorted(n for n, r in rows.items() if r.get("state") == "lost" and n not in core),
+                     time.time(), settings()):
             save_state(st)
 
 

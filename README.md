@@ -18,6 +18,12 @@ servers **the hub gives to its sessions** and says so once, before a session get
 - **No second watchdog.** The core's MCP watch already tells sessions about "needs a login" and reconnects them. The
   plugin adds what it does not do: a stored login that a server now rejects, an erased record, a token that cannot be
   refreshed - and tells the owner once.
+- **A core with its own login strip (Plugin API 1.31, `mcp_waits` in the snapshot).** A server that sessions wait on is
+  signed in through the strip of the hub, so for that server the plugin sends no alarm (the owner or the Hub
+  Developer), shows a grey line "waits for a login: the button is in the hub's strip" instead of **Log in**, and starts
+  neither an automatic reconnect nor `hub mcp login` while the core has a login of it open. Everything else stays: the
+  check of all servers ahead of any session, the view, duplicates, `cover`, the steps of the alarm, **Reconnect**,
+  **Another login**, **Add MCP**. A hub without that strip: the plugin works as before.
 
 ## One pass
 
@@ -114,7 +120,7 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
 - **Sends:** a server's own address gets one `initialize` request with the stored token (https, or localhost; no
   redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
 - **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
-  your click on **Log in**, or after **Add MCP**), `claude mcp add` and `claude mcp remove` (only for the server you
+  your click on **Log in**, or after **Add MCP**, and never for a server the core already waits on), `claude mcp add` and `claude mcp remove` (only for the server you
   add: the second one takes it back if the hub refuses it), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
   (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Another
   login**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
@@ -229,6 +235,10 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 аккаунт). MS365 и Teams: программа сервера выходит и входит заново (код устройства). Сервер с ключом (Grafana и
 подобные): только слова, где в сервисе взять новый ключ и что сказать хабу («смени ключ Grafana»). У сервера без
 аккаунта (локальная программа без ключа, публичные доки) кнопки нет, в строке серым «без аккаунта».
+Если у ядра хаба есть своя полоса «MCP ждёт входа» (Plugin API 1.31), сервером из неё занимается она: по такому серверу
+плагин не шлёт тревог, вместо **Войти** показывает серую строку «ждёт входа — кнопка в полосе хаба» и не запускает
+автопереподключение и `hub mcp login`, пока у ядра идёт вход. Остальное работает как раньше. Хаб без такой полосы: плагин
+ведёт себя как прежде.
 Сам плагин подключённый вход не переключает: хранилище входов Claude Code ему писать нельзя, ключ он не читает и не
 пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключённого только **Другой логин**. Подробнее выше, в разделе про вид.
 

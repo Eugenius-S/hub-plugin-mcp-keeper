@@ -2009,10 +2009,157 @@ class SwitchKinds(Base):
         self.assertNotIn("BAD", script, "a setting with a space or a quote is not written into a script")
 
 
+class FakeWatch:
+    """core.mcpwatch of a Flagman 1.6 core: `view` lists the servers a live session waits on."""
+    ACTIVE = ("asked", "open", "sent")
+
+    @staticmethod
+    def view(st):
+        return [{"server": s, "sessions": ["worker"]} for s in st.get("fake_waits", [])]
+
+
+class OldWatch:
+    """core.mcpwatch before 1.6: no `view`."""
+    ACTIVE = ("asked", "open", "sent")
+
+
+class CoreWaits(Base):
+    """0.10.0, owner 30.10 ("the third of the function is closed by the core, take it out of our plugin"): a server the
+    core waits on itself (mcp_waits, a sign-in of the core under way) gets no alarm, no automatic reconnect, no "Log in"
+    of ours. An older core (no mcpwatch.view): the plugin works as 0.9.1."""
+
+    def core(self, waits=(), logins=None, new=True):
+        from core import mcpwatch  # noqa: F401 - the module exists on every core
+        import core
+        self.hub["fake_waits"] = list(waits)
+        if logins is not None:
+            self.hub["mcp_logins"] = logins
+        p = mock.patch.object(core, "mcpwatch", FakeWatch if new else OldWatch)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def setUp(self):
+        super().setUp()
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        recs["mcpOAuth"].pop("mobbin|abc")
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+        self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
+        self.hub["feeds"] = {main.NAME: []}
+        self.ran = []
+        for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
+                  mock.patch.object(main, "login_result", lambda server: None),
+                  mock.patch.object(main, "run_limited", lambda cmd, timeout, merge=True: (self.ran.append(cmd[2:]) or (0, "waits")))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def reconnects(self, name):
+        return [d for t, d in self.facts if t == "mcp.reconnect" and d["server"] == name]
+
+    def click(self, seq, text):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": "owner", "text": text, "ts": NOW})
+
+    # (a) an older core: as 0.9.1
+    def test_an_older_core_is_no_core_view(self):
+        self.core(new=False)
+        self.assertIsNone(main.core_view(self.hub))
+        self.assertEqual(main.core_busy(self.hub), set())
+
+    def test_an_older_core_alarms_and_reconnects_and_offers_login_as_before(self):
+        self.core(waits=["figma", "canva"], new=False)   # whatever the state says: this core has no strip
+        self.reject("figma", "canva")
+        self.run_once()
+        self.assertEqual(len(self.notes()), 1)
+        self.assertEqual(len(self.reconnects("figma")), 1)
+        rows = self.rows()
+        self.assertTrue(rows["canva"]["can_login"])
+        self.assertNotIn("core_wait", rows["canva"])
+        self.click(1, "login mobbin")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
+
+    # (b) a new core, the server is in mcp_waits
+    def test_a_waiting_server_gets_no_alarm_and_no_reconnect(self):
+        self.core(waits=["figma"])
+        self.reject("figma")
+        self.run_once()
+        self.assertEqual((self.notes(), [d for d in self.dev() if "figma" in d["text"]], self.reconnects("figma")), ([], [], []))
+        self.assertEqual(self.rows()["figma"]["state"], "lost", "the view still tells the truth")
+
+    def test_a_server_with_a_sign_in_of_the_core_under_way_is_left_alone_too(self):
+        self.core(waits=[], logins={"l1": {"server": "figma", "state": "open"}, "l2": {"server": "canva", "state": "done"}})
+        self.reject("figma", "canva")
+        self.run_once()
+        self.assertEqual([d for d in self.dev() if "figma" in d["text"]], [])
+        self.assertEqual(self.reconnects("figma"), [])
+        self.assertTrue(main.core_busy(self.hub) == {"figma"}, "a finished sign-in of the core does not hold the server")
+
+    def test_a_waiting_server_has_no_login_button_but_a_note(self):
+        self.core(waits=["canva"])
+        self.reject("canva")
+        self.run_once()
+        row = self.rows()["canva"]
+        self.assertNotIn("can_login", row)
+        self.assertTrue(row["core_wait"])
+        self.assertTrue(self.rows()["mobbin"]["can_login"], "a server the core does not wait on keeps the button")
+
+    def test_a_click_on_login_of_a_waiting_server_does_not_start_our_login(self):
+        self.core(waits=["canva"])
+        self.reject("canva")
+        self.run_once()
+        self.click(1, "login canva")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        got = self.rows()["canva"]["login"]
+        self.assertEqual(got["state"], "fail")
+        self.assertIn("hub handles", got["why"])
+
+    def test_a_waiting_server_is_not_told_as_a_first_login_either(self):
+        self.core(waits=["mobbin"])
+        self.run_once()
+        self.assertEqual([d for d in self.dev() if "mobbin" in d["text"]], [])
+
+    # (c) a new core, the server is not in mcp_waits: as before
+    def test_a_server_the_core_does_not_wait_on_is_alarmed_and_reconnected(self):
+        self.core(waits=["canva"])
+        self.reject("figma")
+        self.run_once()
+        self.assertEqual(len(self.notes()), 1)
+        self.assertIn("figma", self.notes()[0]["text"])
+        self.assertEqual(len(self.reconnects("figma")), 1)
+
+    def test_a_waiting_server_does_not_hide_another_lost_one_from_the_alarm(self):
+        self.core(waits=["figma"])
+        self.reject("figma", "canva")
+        self.run_once()
+        text = " ".join(n["text"] for n in self.notes())
+        self.assertIn("canva", text)
+        self.assertNotIn("figma", text)
+
+    def test_the_login_of_a_server_the_core_does_not_wait_on_runs(self):
+        self.core(waits=["canva"])
+        self.run_once()
+        self.click(1, "login mobbin")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
+
+    def test_the_manual_reconnect_stays_for_a_waiting_server(self):
+        self.core(waits=["figma"])
+        self.reject("figma")
+        self.run_once()
+        self.facts.clear()
+        self.click(1, "reconnect figma")
+        main.login_step(NOW + 1)
+        self.assertEqual(len(self.reconnects("figma")), 1)
+
+
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.9.1")
+        self.assertEqual(m["version"], "0.10.0")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -2032,13 +2179,14 @@ const view = {};
 const mod = await import(pathToFileURL(process.argv[1]).href);
 mod.default({ lang: "en", el: node, postFeed() {}, addView: (v) => Object.assign(view, v) });
 const root = node("div");
-view.render(root, {});
+view.render(root, process.argv[3] ? JSON.parse(process.argv[3]) : {});
 await new Promise((r) => setTimeout(r, 50));
 const out = {};
 const walk = (n, row) => {
   if (n.tag === "tr" && n.kids[0] && n.kids[0].tag === "td") row = n.kids[0].text;
   if (n.tag === "button") (out[row] = out[row] || []).push(n.cls.replace("btn ", ""));
   if (n.cls === "mk-noacc") (out[row + ":grey"] = out[row + ":grey"] || []).push(n.text);
+  if (n.cls === "mk-core") (out[row + ":core"] = out[row + ":core"] || []).push(n.text);
   n.kids.forEach((k) => k && k.tag && walk(k, row));
 };
 walk(root, "");
@@ -2050,12 +2198,13 @@ class ViewButtons(unittest.TestCase):
     """0.7.1: a connected server has only "Another login"; "Log in" stays for a lost one and a never-logged-in one.
     The page is run in node with a stub hub (no browser)."""
 
-    def buttons(self, rows):
+    def buttons(self, rows, snap=None):
         import shutil
         node = shutil.which("node")
         if not node:
             self.skipTest("no node")
-        got = subprocess.run([node, "--input-type=module", "-e", VIEW_BUTTONS, os.path.join(ROOT, "main.js"), json.dumps(rows)],
+        extra = [json.dumps(snap)] if snap is not None else []
+        got = subprocess.run([node, "--input-type=module", "-e", VIEW_BUTTONS, os.path.join(ROOT, "main.js"), json.dumps(rows), *extra],
                              capture_output=True, text=True, encoding="utf-8", timeout=60)
         self.assertEqual(got.returncode, 0, got.stderr)
         return json.loads(got.stdout)
@@ -2080,6 +2229,30 @@ class ViewButtons(unittest.TestCase):
         self.assertEqual(got["Docs:grey"], ["no account"])
         self.assertNotIn("Docs", got)
         self.assertNotIn("Figma:grey", got)
+
+    def test_a_server_the_core_waits_on_has_a_grey_note_and_no_login(self):
+        # 0.10.0: the core of the hub shows its own "Log in" in its strip (mcp_waits in the snapshot)
+        rows = {"buffer": {"state": "lost", "title": "Buffer", "can_login": True},
+                "mobbin": {"state": "first", "title": "Mobbin", "can_login": True}}
+        got = self.buttons(rows, {"mcp_waits": [{"server": "buffer"}]})
+        self.assertEqual(got["Buffer"], ["mk-reconnect"], "reconnect stays, the login of the core is in its strip")
+        self.assertEqual(got["Buffer:core"], ["waits for a login: the button is in the hub's strip"])
+        self.assertEqual(got["Mobbin"], ["mk-reconnect", "mk-login"], "not waited on by the core: as before")
+        self.assertNotIn("Mobbin:core", got)
+
+    def test_an_older_core_snapshot_changes_nothing_in_the_view(self):
+        rows = {"buffer": {"state": "lost", "title": "Buffer", "can_login": True}}
+        for snap in ({}, {"mcp_waits": None}):
+            got = self.buttons(rows, snap)
+            self.assertEqual(got["Buffer"], ["mk-reconnect", "mk-login"], snap)
+            self.assertNotIn("Buffer:core", got)
+
+    def test_the_page_trusts_an_empty_strip_over_the_row_note(self):
+        # the process wrote core_wait a minute ago, the strip is empty now: the button is back
+        rows = {"buffer": {"state": "lost", "title": "Buffer", "core_wait": True, "can_login": True}}
+        got = self.buttons(rows, {"mcp_waits": []})
+        self.assertNotIn("Buffer:core", got)
+        self.assertIn("mk-login", got["Buffer"])
 
     def test_the_process_never_gives_an_active_row_a_login(self):
         got = main.clean_status({"servers": {"a": {"state": "ok", "can_login": True, "can_switch": True},
