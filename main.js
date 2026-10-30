@@ -19,9 +19,9 @@ const STR = {
     add_hint: "The service gives the name and the address. A key is not typed here: you log in in the browser.",
     add_bad: "Check the name (letters, digits, - and _) and the address (https, no key or parameters in it)",
     add_sent: "adding…", add_ok: "Added: {name}", add_fail: "Not added", add_restart: "Sessions get it after they restart.",
-    remove: "Remove", remove_go: "Remove", remove_cancel: "Cancel", remove_sent: "removing…",
-    remove_ask: "Remove {name} from this machine?", remove_ask_plugin: "Remove the plugin {plugin} with all its servers from Claude Code?",
-    remove_ok: "Removed: {name}", remove_ok_plugin: "Removed the plugin {plugin} with {name}", remove_fail: "Not removed",
+    remove: "Delete", remove_q: "Delete {name}?", remove_plugin: "The whole plugin goes, with its skills.",
+    remove_claude: "The server leaves Claude Code.", remove_go: "Delete", remove_cancel: "Cancel",
+    remove_sent: "deleting…", remove_ok: "Deleted: {name}", remove_fail: "not deleted",
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
@@ -41,9 +41,9 @@ const STR = {
     add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь в браузере.",
     add_bad: "Проверь название (буквы, цифры, - и _) и адрес (https, без ключа и параметров)",
     add_sent: "добавляю…", add_ok: "Добавлено: {name}", add_fail: "Не добавлено", add_restart: "Сессии получат его после перезапуска.",
-    remove: "Удалить", remove_go: "Удалить", remove_cancel: "Отмена", remove_sent: "удаляю…",
-    remove_ask: "Удалить {name} с этого компьютера?", remove_ask_plugin: "Удалить плагин {plugin} из Claude Code целиком, со всеми его серверами?",
-    remove_ok: "Удалено: {name}", remove_ok_plugin: "Удалён плагин {plugin} вместе с {name}", remove_fail: "Не удалено",
+    remove: "Удалить", remove_q: "Удалить {name}?", remove_plugin: "Удалится плагин целиком, с его скиллами.",
+    remove_claude: "Сервер пропадёт из Claude Code.", remove_go: "Удалить", remove_cancel: "Отмена",
+    remove_sent: "удаляю…", remove_ok: "Удалено: {name}", remove_fail: "не удалено",
   },
 };
 const ORDER = { lost: 0, first: 1, ok: 3, skip: 4 };
@@ -53,8 +53,30 @@ let hub;
 let last = { id: 0, at: 0, data: null, snap: null };
 const sent = {};   // server -> {at, act}: the row says what was asked until the process answers
 const SENT_FOR = 20000;
-const asking = new Set();   // servers whose "Remove" waits for a confirmation: nothing goes out before the second click
+const asking = new Set();   // the server whose trash waits for a confirmation (one at a time): nothing goes out before "Delete"
+const deleting = new Map();   // server -> {node, idx}: the row that is "deleting…", kept to fade out when the process says "done"
+let styled = false;
+let focusEl = null;         // what takes the focus after the redraw
+let focusAfter = "";        // after a redraw: "pop" puts the focus on "Cancel", "trash:<server>" back on the trash
 const form = { open: false, name: "", url: "", bad: false, at: 0, focus: "" };   // "Add MCP": what is typed survives a redraw
+const TRASH = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M 10 2 L 9 3 L 4 3 L 4 5 L 5 5 L 5 20 C 5 20.522222 5.1913289 21.05461 5.5683594 21.431641 C 5.9453899 21.808671 6.4777778 22 7 22 L 17 22 C 17.522222 22 18.05461 21.808671 18.431641 21.431641 C 18.808671 21.05461 19 20.522222 19 20 L 19 5 L 20 5 L 20 3 L 15 3 L 14 2 L 10 2 z M 7 5 L 17 5 L 17 20 L 7 20 L 7 5 z M 9 7 L 9 18 L 11 18 L 11 7 L 9 7 z M 13 7 L 13 18 L 15 18 L 15 7 L 13 7 z"/></svg>';   // Icons8 Material Outlined "Trash"
+const CSS = `
+.mk-table td.mk-delc { width: 1%; padding: 6px 4px; position: relative; text-align: right; }
+.mk-del { width: 32px; height: 32px; min-height: 32px; padding: 0; justify-content: center;
+  border-color: transparent; background: transparent; color: var(--muted-foreground); }
+.mk-del svg { width: 18px; height: 18px; fill: currentColor; }
+.mk-del:hover, .mk-del[aria-expanded="true"] { background: var(--accent); color: var(--foreground); }
+.mk-pop { position: absolute; right: 4px; top: calc(100% - 2px); z-index: var(--z-menu);
+  width: min(300px, calc(100vw - 32px)); padding: 16px; border-radius: var(--radius-lg);
+  background: var(--card); box-shadow: var(--shadow-lift); color: var(--foreground); text-align: left; white-space: normal; }
+.mk-pop-t { margin: 0; font-weight: 600; line-height: 1.3; }
+.mk-pop-p { margin: 4px 0 0; color: var(--muted-foreground); font-size: var(--text-sm); line-height: 1.45; }
+.mk-pop-b { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: 16px; }
+.mk-row-busy td:not(.mk-delc) { opacity: .55; }
+.mk-busy { opacity: .8; }
+.mk-row-gone td { opacity: .3; overflow: hidden; transition: opacity 240ms var(--ease-out), padding 240ms var(--ease-out), font-size 240ms var(--ease-out), line-height 240ms var(--ease-out); }
+.mk-row-gone.mk-out td { opacity: 0; padding-top: 0; padding-bottom: 0; font-size: 0; line-height: 0; }
+`;
 const NAME_OK = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
 const URL_OK = /^(https:\/\/[A-Za-z0-9.-]{1,200}(:\d{1,5})?|http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?)(\/[A-Za-z0-9._~%+/-]{0,200})?$/;   // like the process: no login, query or key
 
@@ -128,33 +150,64 @@ function button(cls, label, text, name, act, td) {
 // The actions of a row: "Another login" for a connected server with a login of its own (the process opens a
 // terminal where the login is changed), "Reconnect" (the server reconnects in every running session, no login) for a lost
 // one, "Log in" / "Log in again" (the process runs `hub mcp login`) where a login can help; or what is going on now.
-// "Remove": the first click asks (a plugin goes whole, with its other servers), the second posts "remove <server>"; the
-// process runs the Claude Code command and says how it went in data.remove. Servers of the hub's catalog have no button.
-function removeButton(name, s, td) {
-  if (!asking.has(name)) {
-    const btn = hub.el("button", "btn mk-remove", tr("remove"));
-    btn.type = "button";
-    btn.onclick = () => { asking.add(name); draw(root_); };
-    return btn;
-  }
-  const box = hub.el("div", "mk-remove-ask");
-  box.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center";
-  const q = hub.el("span", "mk-remove-q", s.can_remove === "plugin" ? tr("remove_ask_plugin", { plugin: s.plugin || name }) : tr("remove_ask", { name: s.title || name }));
-  q.style.cssText = "white-space:normal;max-width:22em";
-  const go = hub.el("button", "btn mk-remove-go", tr("remove_go"));
+// "Delete": a trash in a narrow column of its own; the click opens a popover (a plugin goes whole, with its skills), "Delete"
+// posts "remove <server>"; the process runs the Claude Code command and says how it went in data.remove. Servers of the
+// hub's catalog have no trash.
+function closeAsk(name) {
+  asking.clear();
+  focusAfter = "trash:" + name;
+  if (root_) draw(root_);
+}
+
+function trashCell(row, name, s, gone) {
+  const td = hub.el("td", "mk-delc");
+  td.style.cssText = "border-top:1px solid rgba(127,127,127,.2)";
+  row.append(td);
+  if (!s.can_remove || gone) return;
+  const open = asking.has(name);
+  const btn = hub.el("button", "btn mk-del");
+  btn.type = "button";
+  btn.innerHTML = TRASH;
+  btn.title = tr("remove");
+  btn.setAttribute("aria-label", tr("remove") + " " + (s.title || name));
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  btn.onclick = () => {
+    const was = asking.has(name);
+    asking.clear();
+    if (!was) { asking.add(name); focusAfter = "pop"; }
+    else focusAfter = "trash:" + name;
+    draw(root_);
+  };
+  td.append(btn);
+  if (focusAfter === "trash:" + name) focusEl = btn;
+  if (!open) return;
+  const pop = hub.el("div", "mk-pop");
+  pop.setAttribute("role", "dialog");
+  pop.setAttribute("aria-label", tr("remove_q", { name: s.title || name }));
+  const b = hub.el("div", "mk-pop-b");
+  const cancel = hub.el("button", "btn mk-pop-cancel", tr("remove_cancel"));
+  cancel.type = "button";
+  cancel.onclick = () => closeAsk(name);
+  const go = hub.el("button", "btn action mk-pop-go", tr("remove_go"));
   go.type = "button";
   go.onclick = () => {
-    asking.delete(name);
+    asking.clear();
     sent[name] = { at: Date.now(), act: "remove" };
-    hub.postFeed("remove " + name);
-    td.replaceChildren(hub.el("span", "", tr("remove_sent")));
+    hub.postFeed("remove " + name);   // the process reads the channel and does what the Claude Code command would
     setTimeout(() => load(null, true).then(() => draw(root_)).catch(() => {}), 6000);
+    draw(root_);
   };
-  const cancel = hub.el("button", "btn mk-remove-cancel", tr("remove_cancel"));
-  cancel.type = "button";
-  cancel.onclick = () => { asking.delete(name); draw(root_); };
-  box.append(q, go, cancel);
-  return box;
+  b.append(cancel, go);
+  if (focusAfter === "pop") focusEl = cancel;
+  pop.append(hub.el("p", "mk-pop-t", tr("remove_q", { name: s.title || name })),
+    hub.el("p", "mk-pop-p", tr(s.can_remove === "plugin" ? "remove_plugin" : "remove_claude")), b);
+  td.append(pop);
+}
+
+// a "Delete" was sent and the process has not answered yet (its answer, data.remove, is newer than the click)
+function removing(name) {
+  const rm = (last.data && last.data.remove) || {};
+  return !!sent[name] && sent[name].act === "remove" && mine(name) && !(rm.at && rm.at * 1000 >= sent[name].at);
 }
 
 function actionCell(row, name, s) {
@@ -166,13 +219,12 @@ function actionCell(row, name, s) {
   const sw = l.act === "switch";
   const busy = (re && l.state === "sent") || (!re && !sw && l.state === "wait");
   const rm = (last.data && last.data.remove) || {};
-  const removing = sent[name] && sent[name].act === "remove";
-  const asked = sent[name] && mine(name) &&
-    !(removing ? rm.at && rm.at * 1000 >= sent[name].at : l.at && l.at * 1000 >= sent[name].at && l.state !== "sent" && l.state !== "wait");
+  const asked = sent[name] && mine(name) && (sent[name].act === "remove" ? removing(name) :
+    !(l.at && l.at * 1000 >= sent[name].at && l.state !== "sent" && l.state !== "wait"));
   if (busy || asked) {
     const act = asked ? sent[name].act : re ? "reconnect" : "login";
-    td.textContent = tr(act === "remove" ? "remove_sent" : act === "reconnect" ? "reconnect_sent" : act === "switch" ? "switch_sent" : l.state === "wait" ? "login_wait" : "login_sent");
-    td.style.opacity = ".8";
+    const text = tr(act === "remove" ? "remove_sent" : act === "reconnect" ? "reconnect_sent" : act === "switch" ? "switch_sent" : l.state === "wait" ? "login_wait" : "login_sent");
+    td.append(hub.el("span", "mk-busy", text));
     return;
   }
   if (l.state === "done" && !re && !sw && !s.can_login) {
@@ -186,6 +238,11 @@ function actionCell(row, name, s) {
     msg.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-bottom:4px;white-space:normal";
     td.append(msg);
   }
+  if (rm.state === "fail" && rm.name === name) {
+    const msg = hub.el("div", "mk-fail", tr("remove_fail") + (rm.why ? ": " + rm.why : ""));
+    msg.style.cssText = "color:" + COLOR.lost + ";font-size:.9em;margin-bottom:4px;white-space:normal";
+    td.append(msg);
+  }
   const bar = hub.el("div", "mk-acts");
   bar.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
   if (s.can_switch) bar.append(button("mk-switch", "switch", "switch_sent", name, "switch", td));
@@ -197,7 +254,6 @@ function actionCell(row, name, s) {
     hint.style.cssText = "opacity:.7;font-size:.9em;align-self:center";
     bar.append(hint);
   }
-  if (s.can_remove) bar.append(removeButton(name, s, td));
   if (bar.firstChild) td.append(bar);
   else if (s.no_account) {
     const grey = hub.el("span", "mk-noacc", tr("no_account"));
@@ -272,15 +328,13 @@ function addBox(d) {
   return wrap;
 }
 
-// how the last "Remove" went: the row is gone on success, so the line is the only trace of it
+// how the last "Delete" went: the row is gone on success, so the line under the table is the only trace of it (a failure
+// stays in the row, above the buttons)
 function removedLine(d) {
   const rm = d.remove;
-  if (!rm) return hub.el("span");
-  const ok = rm.state === "done";
-  const text = ok ? (rm.plugin ? tr("remove_ok_plugin", { plugin: rm.plugin, name: rm.name }) : tr("remove_ok", { name: rm.name })) :
-    tr("remove_fail") + ": " + rm.name + (rm.why ? " (" + rm.why + ")" : "");
-  const line = hub.el("div", ok ? "mk-done mk-removed" : "mk-fail mk-removed", text);
-  line.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-top:10px;white-space:normal";
+  if (!rm || rm.state !== "done") return hub.el("span");
+  const line = hub.el("div", "mk-done mk-removed", tr("remove_ok", { name: rm.name }));
+  line.style.cssText = "color:" + COLOR.ok + ";font-size:.9em;margin:12px 0 0;white-space:normal";
   return line;
 }
 
@@ -304,10 +358,33 @@ function autoBox(d) {
 
 let root_ = null;
 
+// the row of a server that was "deleting…" and is gone from the table now: its last picture fades out (240 ms, ease-out)
+// and folds up, instead of vanishing at once; with reduced motion it just goes
+function fadeOut(table, d, rows) {
+  const rm = d.remove || {};
+  for (const [name, row] of [...deleting]) {
+    if (rows.some(([n]) => n === name)) continue;
+    deleting.delete(name);
+    if (rm.state !== "done" || rm.name !== name || !row.node.cloneNode) continue;
+    if (typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches) continue;
+    const ghost = row.node.cloneNode(true);
+    ghost.className = "mk-row-gone";
+    table.insertBefore(ghost, table.children[Math.min(row.idx, table.children.length)] || null);
+    setTimeout(() => { ghost.className = "mk-row-gone mk-out"; }, 30);
+    setTimeout(() => ghost.remove(), 300);
+  }
+}
+
 function draw(root) {
   root_ = root;
   const d = last.data;
   root.replaceChildren();
+  if (typeof document !== "undefined" && !styled) {
+    styled = true;
+    const st = document.createElement("style");
+    st.textContent = CSS;
+    document.head.append(st);
+  }
   const wrap = hub.el("div", "mk");
   wrap.style.cssText = "padding:16px;max-width:760px";
   if (!d) {
@@ -327,13 +404,18 @@ function draw(root) {
     th.style.cssText = "text-align:left;padding:6px 8px;opacity:.7;font-weight:500";
     head.append(th);
   }
-  const acts = (s) => s.can_remove || s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
-  const withActs = shown.some(([, s]) => acts(s));
+  const rmFail = (name) => d.remove && d.remove.state === "fail" && d.remove.name === name;   // the failure of a deletion is told in the row
+  const acts = (s, name) => rmFail(name) || removing(name) || s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
+  const withActs = shown.some(([n, s]) => acts(s, n));
   if (withActs) head.append(hub.el("th"));
+  const withDel = shown.some(([, s]) => s.can_remove);
+  if (withDel) head.append(hub.el("th"));   // the trash column: narrow, no title
   table.append(head);
   const rows = shown.sort((a, b) => (ORDER[a[1].state] ?? 9) - (ORDER[b[1].state] ?? 9) || a[0].localeCompare(b[0]));
+  let at = 1;   // the header is the table's first child
   for (const [name, s] of rows) {
-    const tr_ = hub.el("tr");
+    const gone = removing(name);
+    const tr_ = hub.el("tr", gone ? "mk-row-busy" : "");
     const cell = (text, css = "") => {
       const td = hub.el("td", "", text);
       td.style.cssText = "padding:6px 8px;border-top:1px solid rgba(127,127,127,.2);" + css;
@@ -345,10 +427,15 @@ function draw(root) {
     st.style.color = COLOR[s.state] || "";
     if (by) cell(s.by || "", "font-family:ui-monospace,monospace;opacity:.8");
     cell(s.ok_at || s.state !== "skip" ? when(s.ok_at) : "");
-    if (acts(s)) actionCell(tr_, name, s);
+    if (acts(s, name)) actionCell(tr_, name, s);
     else if (withActs) cell("");
+    if (withDel) trashCell(tr_, name, s, gone);
+    if (gone) deleting.set(name, { node: tr_, idx: at });
+    else deleting.delete(name);
     table.append(tr_);
+    at++;
   }
+  fadeOut(table, d, rows);
   wrap.append(table);
   if (quiet.length) {
     const note = hub.el("p", "mk-ignored", tr("ignored") + ": " + quiet.join(", "));
@@ -359,12 +446,27 @@ function draw(root) {
   wrap.append(addBox(d));
   wrap.append(autoBox(d));
   root.append(wrap);
+  if (focusAfter) {
+    focusAfter = "";
+    if (focusEl && focusEl.focus) focusEl.focus();
+  }
+  focusEl = null;
   const typed = form.open && form.focus ? wrap.querySelector(".mk-add-" + form.focus) : null;
   if (typed) typed.focus();   // a redraw (the status changed) does not take the cursor away
 }
 
 export default function register(h) {
   hub = h;
+  if (typeof document !== "undefined") {
+    document.addEventListener("keydown", (e) => {   // Esc closes the question and the focus goes back to the trash
+      if (e.key === "Escape" && asking.size) closeAsk([...asking][0]);
+    });
+    document.addEventListener("mousedown", (e) => {   // a click outside the question closes it
+      if (!asking.size || (e.target && e.target.closest && e.target.closest(".mk-delc"))) return;
+      asking.clear();
+      if (root_) draw(root_);
+    });
+  }
   hub.addView({
     id: NAME,
     title: tr("title"),

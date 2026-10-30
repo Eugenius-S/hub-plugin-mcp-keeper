@@ -2394,7 +2394,9 @@ const node = (tag, cls = "", text = "") => {
   n.append = (...k) => { n.kids.push(...k); n.firstChild = n.kids[0] || null; };
   n.replaceChildren = (...k) => { n.kids = []; n.firstChild = null; n.append(...k); };
   n.querySelector = (sel) => find(n, sel.slice(1));
-  n.focus = () => {};
+  n.attrs = {};
+  n.setAttribute = (k, v) => { n.attrs[k] = v; };
+  n.focus = () => { globalThis.focused = n.cls; };
   return n;
 };
 const find = (n, c) => {
@@ -2424,7 +2426,9 @@ for (const step of arg.steps) {
 const texts = {};
 for (const n of all(root)) for (const c of (n.cls || "").split(" ")) if (c.startsWith("mk-") && n.text) texts[c] = n.text;
 const classes = all(root).flatMap((n) => (n.cls || "").split(" ")).filter((c) => c.startsWith("mk-add"));
-console.log(JSON.stringify({ posts, texts, classes }));
+const attrs = {};
+for (const n of all(root)) for (const c of (n.cls || "").split(" ")) if (c.startsWith("mk-") && Object.keys(n.attrs).length) attrs[c] = n.attrs;
+console.log(JSON.stringify({ posts, texts, classes, attrs, focused: globalThis.focused || "" }));
 process.exit(0);
 """
 
@@ -2492,11 +2496,11 @@ class ViewAddForm(unittest.TestCase):
         self.assertTrue(got["texts"]["mk-add-login"].endswith(": the browser was closed"))
 
 
-VIEW_REMOVE = VIEW_ADD.replace('startsWith("mk-add")', 'startsWith("mk-remove")')
+VIEW_REMOVE = VIEW_ADD.replace('c.startsWith("mk-add")', '/^mk-(del|pop|row|fail|done|busy)/.test(c)')
 
 
 class ViewRemoveButton(unittest.TestCase):
-    """0.11.0: the "Remove" button asks first, the second click posts "remove <server>"; run in node with a stub hub."""
+    """0.11.0: the trash in a column of its own; its popover asks, "Delete" posts "remove <server>"; run in node with a stub hub."""
 
     def run_view(self, steps, servers, extra=None):
         import shutil
@@ -2512,39 +2516,63 @@ class ViewRemoveButton(unittest.TestCase):
     USER = {"newsvc": {"state": "ok", "title": "Newsvc", "can_remove": "user"}}
     PLUGIN = {"plugin:draw:pen": {"state": "ok", "title": "Pen", "can_remove": "plugin", "plugin": "draw"}}
 
-    def test_a_row_without_can_remove_has_no_button(self):
+    def test_a_row_without_can_remove_has_no_trash_and_no_column(self):
         got = self.run_view([], {"figma": {"state": "ok", "title": "Figma", "can_switch": True}})
-        self.assertNotIn("mk-remove", got["classes"])
+        self.assertNotIn("mk-del", got["classes"])
+        self.assertNotIn("mk-delc", got["classes"])
 
-    def test_the_first_click_only_asks(self):
-        got = self.run_view([{"click": "mk-remove"}], self.USER)
-        self.assertEqual(got["posts"], [])
-        self.assertEqual(got["texts"]["mk-remove-q"], "Remove Newsvc from this machine?")
-        self.assertTrue({"mk-remove-go", "mk-remove-cancel"} <= set(got["classes"]))
-        self.assertNotIn("mk-remove", got["classes"])
+    def test_the_trash_sits_in_its_own_column_and_asks_in_a_popover(self):
+        got = self.run_view([], self.USER)
+        self.assertIn("mk-delc", got["classes"])
+        self.assertEqual(got["attrs"]["mk-del"]["aria-expanded"], "false")
+        self.assertEqual(got["attrs"]["mk-del"]["aria-label"], "Delete Newsvc")
+        got = self.run_view([{"click": "mk-del"}], self.USER)
+        self.assertEqual(got["posts"], [], "the first click only opens the question")
+        self.assertEqual(got["texts"]["mk-pop-t"], "Delete Newsvc?")
+        self.assertEqual(got["texts"]["mk-pop-p"], "The server leaves Claude Code.")
+        self.assertTrue({"mk-pop", "mk-pop-go", "mk-pop-cancel"} <= set(got["classes"]))
+        self.assertEqual(got["attrs"]["mk-del"]["aria-expanded"], "true")
+        self.assertEqual(got["attrs"]["mk-pop"]["role"], "dialog")
+        self.assertEqual(got["focused"], "btn mk-pop-cancel", "the focus goes to the safe button")
 
-    def test_the_second_click_posts_one_remove(self):
-        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-go"}], self.USER)
+    def test_delete_posts_one_remove_and_the_row_says_deleting(self):
+        got = self.run_view([{"click": "mk-del"}, {"click": "mk-pop-go"}], self.USER)
         self.assertEqual(got["posts"], ["remove newsvc"])
-        self.assertEqual(got["texts"].get("mk-remove-q"), None)
+        self.assertNotIn("mk-pop", got["classes"])
+        self.assertEqual(got["texts"]["mk-busy"], "deleting…")
+        self.assertIn("mk-row-busy", got["classes"])
+        self.assertNotIn("mk-del", got["classes"], "no trash while the row is being deleted")
 
-    def test_cancel_brings_the_button_back_and_posts_nothing(self):
-        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-cancel"}], self.USER)
+    def test_cancel_closes_the_popover_posts_nothing_and_the_focus_goes_back(self):
+        got = self.run_view([{"click": "mk-del"}, {"click": "mk-pop-cancel"}], self.USER)
         self.assertEqual(got["posts"], [])
-        self.assertIn("mk-remove", got["classes"])
-        self.assertNotIn("mk-remove-go", got["classes"])
+        self.assertNotIn("mk-pop", got["classes"])
+        self.assertEqual(got["attrs"]["mk-del"]["aria-expanded"], "false")
+        self.assertEqual(got["focused"], "btn mk-del")
+
+    def test_the_second_click_on_the_trash_closes_the_popover(self):
+        got = self.run_view([{"click": "mk-del"}, {"click": "mk-del"}], self.USER)
+        self.assertNotIn("mk-pop", got["classes"])
+        self.assertEqual(got["posts"], [])
 
     def test_a_plugin_says_the_whole_plugin_goes(self):
-        got = self.run_view([{"click": "mk-remove"}], self.PLUGIN)
-        self.assertIn("plugin draw with all its servers", got["texts"]["mk-remove-q"])
-        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-go"}], self.PLUGIN)
+        got = self.run_view([{"click": "mk-del"}], self.PLUGIN)
+        self.assertEqual(got["texts"]["mk-pop-p"], "The whole plugin goes, with its skills.")
+        got = self.run_view([{"click": "mk-del"}, {"click": "mk-pop-go"}], self.PLUGIN)
         self.assertEqual(got["posts"], ["remove plugin:draw:pen"])
 
-    def test_the_answer_of_the_process_is_shown(self):
+    def test_a_failure_stays_in_the_row_with_the_reason_and_the_trash_stays(self):
+        got = self.run_view([], self.USER, {"remove": {"state": "fail", "name": "newsvc", "at": 5, "why": "claude failed"}})
+        self.assertEqual(got["texts"]["mk-fail"], "not deleted: claude failed")
+        self.assertIn("mk-del", got["classes"])
+        got = self.run_view([], self.USER, {"remove": {"state": "fail", "name": "other", "at": 5, "why": "claude failed"}})
+        self.assertNotIn("mk-fail", got["classes"], "another server's failure is not shown on this row")
+
+    def test_success_leaves_one_line_under_the_table(self):
         got = self.run_view([], {}, {"remove": {"state": "done", "name": "newsvc", "at": 5}})
-        self.assertEqual(got["texts"]["mk-removed"], "Removed: newsvc")
-        got = self.run_view([], {}, {"remove": {"state": "fail", "name": "newsvc", "at": 5, "why": "claude failed"}})
-        self.assertEqual(got["texts"]["mk-removed"], "Not removed: newsvc (claude failed)")
+        self.assertEqual(got["texts"]["mk-done"], "Deleted: newsvc")
+        got = self.run_view([], {}, {"remove": {"state": "fail", "name": "newsvc", "at": 5, "why": "x"}})
+        self.assertNotIn("mk-done", got["classes"])
 
 
 class JsStrings(unittest.TestCase):

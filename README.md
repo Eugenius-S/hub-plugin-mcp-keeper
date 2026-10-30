@@ -215,13 +215,14 @@ Buttons of a row:
   the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
   end, then the result (done, or why not); a login that went through makes the next check start at once.
 
-- **Remove** - only on a server that lives on this machine outside the hub catalog: a server you added to Claude Code
-  yourself (`~/.claude.json`, user scope), or a server of a Claude Code plugin. A click asks first ("Remove X from this
-  machine?"; for a plugin: "Remove the plugin P with all its servers from Claude Code?"); the second click posts
+- **Delete** (the trash icon in a narrow column at the right edge of the row) - only on a server that lives on this machine outside the hub catalog: a server you added to Claude Code
+  yourself (`~/.claude.json`, user scope), or a server of a Claude Code plugin. A click opens a small question
+  under the icon ("Delete X?" and "The server leaves Claude Code."; for a plugin: "The whole plugin goes, with its skills.");
+  Esc, Cancel or a click elsewhere closes it, "Delete" posts
   `remove <server>` to the plugin's feed (only your own, fresh post counts, once). The process runs what you would type:
   `claude mcp remove -s user <server>`, or `claude plugin uninstall -s user <plugin>@<marketplace>` for a plugin (the
   whole plugin goes, with its other servers, skills and commands), checks that the server is gone and drops its row.
-  The row says "Removed" or why not. Servers of the hub catalog (`hub.json`, `mcp`), programs with no source, the
+  The row says "deleting…", then a line under the table says "Deleted: X"; if it failed, the row says "not deleted" and why. Servers of the hub catalog (`hub.json`, `mcp`), programs with no source, the
   read-only `conduit` and a server of a project block have no button: the plugin does not write `hub.json`. Nothing
   is deleted from disk besides what Claude Code itself removes; no login is touched.
 
@@ -265,12 +266,13 @@ add` добавляет сервер в `~/.claude.json`, `hub tools import mcp`
 оболочки) не запускается. Окно открывает только ваш клик, секретов в скрипте нет, ключи не читаются и не пишутся, новых
 адресов нет.
 
-Кнопка **Удалить** есть только у сервера, который лежит на этом компьютере вне каталога хаба: добавленного вами в Claude
-Code (`~/.claude.json`, уровень пользователя) или сервера плагина Claude Code. Первый клик спрашивает («Удалить X с
-этого компьютера?»; для плагина: «Удалить плагин P из Claude Code целиком, со всеми его серверами?»), второй кладёт в
+Кнопка **Удалить** (корзина в узкой колонке у правого края строки) есть только у сервера, который лежит на этом компьютере вне каталога хаба: добавленного вами в Claude
+Code (`~/.claude.json`, уровень пользователя) или сервера плагина Claude Code. Клик открывает маленький вопрос
+под значком («Удалить X?» и «Сервер пропадёт из Claude Code.»; для плагина: «Удалится плагин целиком, с его скиллами.»);
+Esc, «Отмена» или клик в сторону закрывают его, «Удалить» кладёт в
 ленту плагина `remove <сервер>` (считается только ваш свежий пост, один раз). Процесс делает то же, что набрали бы вы:
 `claude mcp remove -s user <сервер>` или `claude plugin uninstall -s user <плагин>@<маркет>` (плагин уходит целиком),
-проверяет, что сервера больше нет, и убирает строку. Серверы каталога хаба, программы без источника, `conduit` и серверы
+проверяет, что сервера больше нет, и убирает строку. Строка пишет «удаляю…», потом под таблицей «Удалено: X»; не вышло: «не удалено» и причина. Серверы каталога хаба, программы без источника, `conduit` и серверы
 блока проекта без кнопки: плагин `hub.json` не пишет.
 
 Под таблицей кнопка **Добавить MCP**: название (буквы, цифры, `-`, `_`, до 40 знаков) и адрес, который даёт сам сервис
