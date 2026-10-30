@@ -47,7 +47,7 @@ class Base(unittest.TestCase):
         patches = [
             mock.patch.object(main, "put", lambda t, d, entity=None: self.facts.append((t, d))),
             mock.patch.object(main, "mcp_get", self.fake_get),
-            mock.patch.object(main, "probe", lambda ent: self.probes.get(ent.get("serverUrl"), (True, 200))),
+            mock.patch.object(main, "probe", lambda ent: self.answer(ent.get("serverUrl"))),
             mock.patch.object(main, "probe_keyed", self.fake_keyed),
             mock.patch.object(main, "net_up", lambda: True),
             mock.patch.object(main, "processes", lambda name: [{"pid": 1, "started": "x", "kind": "claude"}]),
@@ -81,7 +81,14 @@ class Base(unittest.TestCase):
 
     def fake_keyed(self, url, head):
         self.keyed.append((url, sorted(head)))
-        return self.probes.get(url, (True, 200))
+        return self.answer(url)
+
+    def answer(self, url):
+        """What the server at `url` answers: a tuple, or a list of them (consumed, the last repeats)."""
+        out = self.probes.get(url, (True, 200))
+        if isinstance(out, list):
+            out = out.pop(0) if len(out) > 1 else out[0]
+        return out
 
     def tick(self, seconds):
         self.clock += seconds
@@ -216,6 +223,12 @@ class Pass(Base):
         self.assertIn("hub mcp login hub canva", notes[0]["text"])
         sent = [d for t, d in self.facts if t == "message.received"]
         self.assertEqual([d["to"] for d in sent], ["worker"])   # busy with canva; the parked one is not woken
+
+    def test_one_rejection_is_not_a_loss(self):
+        self.probes[URLS["canva"]] = [(False, 401), (True, 200)]
+        res = self.run_once()
+        self.assertEqual(res["servers"]["canva"]["state"], "ok")
+        self.assertEqual(self.notes(), [])
 
     def test_network_doubt_is_not_lost(self):
         self.probes[URLS["figma"]] = (None, None)
@@ -906,6 +919,21 @@ class Headers(Base):
         self.run_once(NOW + 3600)
         self.assertEqual(self.notes(), [])
 
+    def test_one_rejected_key_is_not_a_loss(self):
+        self.probes["https://b/mcp"] = [(False, 403), (True, 200)]
+        res = self.run_once()
+        self.assertEqual(res["servers"]["buffer"]["state"], "ok")
+        self.assertEqual(self.notes(), [])
+
+    def test_one_rejected_key_in_cover_is_not_a_loss(self):
+        self.config({"mcp": {"buffer": {"server": {"type": "http", "url": "https://b/mcp", "headersHelper": "helper"}}}},
+                    plugin={"cover": True})
+        self.probes["https://b/mcp"] = [(False, 403), (True, 200)]
+        res = self.run_once()
+        self.assertEqual(res["servers"]["buffer"]["state"], "ok")
+        self.assertEqual([d for t, d in self.facts if t == "mcp.reconnect" and d["server"] == "buffer"], [])
+        self.assertEqual([d for d in self.dev() if "buffer" in d["text"]], [])
+
     def test_helper_failure_is_lost(self):
         for out in [(1, ""), (0, "not json"), (0, "{}"), (0, '{"A": 5}')]:
             self.helper = out
@@ -994,7 +1022,7 @@ class Cover(Base):
 
     def fake_with(self, url, head):
         self.bearer.append(url)
-        return self.probes.get(url, (True, 200))
+        return self.answer(url)
 
     def on(self, value=True, **extra):
         self.config({}, plugin={"cover": value, **extra})
@@ -1090,6 +1118,67 @@ class Cover(Base):
             s = self.run_once()["servers"]["conduit"]
         self.assertEqual((s["state"], s["by"]), ("skip", "conduit"))
         self.assertNotIn("conduit", self.asked)
+
+    def reconnects(self, name):
+        return [d["server"] for t, d in self.facts if t == "mcp.reconnect" and d["server"] == name]
+
+    def silent(self, name, i=None):
+        """Nobody was told about `name` (neither the Hub Developer nor the owner) and it was not reconnected."""
+        told = [d for d in self.dev() if name in d["text"]]
+        self.assertEqual((told, self.notes(), self.reconnects(name)), ([], [], []), i)
+
+    def test_one_rejection_is_not_a_loss(self):
+        # 0.9.1: a lone 401 (a token read before its refresh, a helper's stale answer) is asked again in the same pass
+        self.gate()
+        self.probes["https://gate.example/mcp"] = [(False, 401), (True, 200)]
+        s = self.run_once()["servers"]["gate"]
+        self.assertEqual(s["state"], "ok")
+        self.silent("gate")
+
+    def test_rejected_twice_is_lost_and_told(self):
+        self.gate()
+        self.probes["https://gate.example/mcp"] = (False, 401)
+        s = self.run_once()["servers"]["gate"]
+        self.assertEqual(s["state"], "lost")
+        self.assertIn("gate (claude)", " ".join(d["text"] for d in self.dev()))
+        self.assertEqual(self.reconnects("gate"), ["gate"])
+
+    def test_the_second_look_waits_a_minute(self):
+        self.gate()
+        self.probes["https://gate.example/mcp"] = [(False, 401), (True, 200)]
+        before = self.clock
+        self.run_once()
+        self.assertGreaterEqual(self.clock - before, main.REJECT_PAUSE)
+
+    def test_a_shaken_network_gives_no_verdict(self):
+        # the machine slept or lost the network during the pause: the second answer is no proof either way
+        self.gate()
+        self.probes["https://gate.example/mcp"] = (False, 401)
+
+        def shake(seconds):
+            self.clock += seconds
+            main.CALM.shaken = self.clock
+        with mock.patch.object(main.time, "sleep", shake):
+            res = self.run_once()
+        self.assertNotEqual(res["servers"].get("gate", {}).get("state"), "lost")
+        self.silent("gate")
+
+    def test_conduit_is_never_alarmed_or_reconnected(self):
+        # 0.9.1: conduit is only looked at: the view shows a rejection, nobody is told and nothing is reconnected
+        self.creds(conduit={"serverUrl": "https://c/mcp", "accessToken": "c", "refreshToken": "r",
+                            "expiresAt": (NOW + 3600) * 1000})
+        self.probes["https://c/mcp"] = (False, 401)
+        with mock.patch.object(main, "user_servers", lambda: {"conduit": {"type": "http", "url": "https://c/mcp"}}):
+            for i in range(4):
+                s = self.run_once(NOW + i * 900)["servers"]["conduit"]
+                self.assertEqual((s["state"], s["by"]), ("lost", "conduit"), i)
+                self.silent("conduit", i)
+
+    def test_mcp_remote_one_rejection_is_not_a_loss(self):
+        self.tokens(NOW + 3600)
+        self.probes[self.REMOTE] = [(False, 401), (True, 200)]
+        self.assertEqual(self.run_once()["servers"]["rem"]["state"], "ok")
+        self.silent("rem")
 
     def test_mcp_remote_is_read_and_its_bearer_sent_only_to_its_address(self):
         self.tokens(NOW + 3600)
@@ -1923,7 +2012,7 @@ class SwitchKinds(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.9.0")
+        self.assertEqual(m["version"], "0.9.1")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)

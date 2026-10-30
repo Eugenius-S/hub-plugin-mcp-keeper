@@ -81,6 +81,7 @@ SWITCH_SHOW = 300         # "terminal opened" stays in the row this long
 TRIES = 3
 RETRIES = 3               # a server the pass could not judge is asked again this many times before it shows as lost
 RETRY_PAUSE = 20          # seconds between those tries (sessions reconnect it in between, when auto is on)
+REJECT_PAUSE = 60         # a 401/403 is asked again after this many seconds (credentials read anew) before it is a loss
 AUTO_EVERY = 600          # auto reconnect of one server - not more often than this
 RECONNECT_WAIT = 15       # a reconnect from the view: the sessions take it in, then this one server is checked again
 RECHECK_ASYNC = True      # tests: the check after a click runs in the same thread
@@ -1034,7 +1035,7 @@ def checkup(conf, now, st, hub, hub_st, only=None):
             ok, code = probe({**ent, "serverUrl": ent.get("serverUrl") or url}) if same_server(ent.get("serverUrl"), url) \
                 else (None, None)
             if ok is False:
-                row = lose(tr("why_rejected", code=code))
+                row = {**lose(tr("why_rejected", code=code)), "rejected": True}
             elif ok:
                 row = {"state": "ok"}
         elif ent.get("refreshToken"):
@@ -1064,7 +1065,7 @@ def checkup(conf, now, st, hub, hub_st, only=None):
             row = {"state": "later"} if why == "later" else {"state": "lost", "why": why, "fix": fix}
         else:
             ok, code = probe_keyed(srv["url"], head)
-            row = ({"state": "lost", "why": tr("why_headers", code=code), "fix": fix} if ok is False
+            row = ({"state": "lost", "why": tr("why_headers", code=code), "fix": fix, "rejected": True} if ok is False
                    else {"state": "ok"} if ok else {"state": "later"})
         out[name] = {**row, "by": "headers"} if cover else row
     if cover:
@@ -1108,7 +1109,7 @@ def read_only_row(ent, now, lose):
     expires = (ent.get("expiresAt") or 0) / 1000
     if ent.get("accessToken") and (not expires or expires > now + 60):
         ok, code = probe(ent)
-        return (lose(tr("why_rejected", code=code)) if ok is False else
+        return ({**lose(tr("why_rejected", code=code)), "rejected": True} if ok is False else
                 {"state": "ok", "by": "conduit"} if ok else {"state": "later", "by": "conduit"})
     if ent.get("refreshToken"):
         return {"state": "skip", "why": tr("why_read_only"), "by": "conduit"}
@@ -1133,8 +1134,8 @@ def programs(conf, now, out, logged, had, hub, catalog, only=None):
             logged.append(name)
             if tok["access"] and (not tok["expires"] or tok["expires"] > now + 60):
                 ok, code = probe_with(url, {"Authorization": "Bearer " + tok["access"]})
-                out[name] = ({"state": "lost", "why": tr("why_rejected", code=code), "fix": fix, "by": holder}
-                             if ok is False else {"state": "ok" if ok else "later", "by": holder})
+                out[name] = ({"state": "lost", "why": tr("why_rejected", code=code), "fix": fix, "by": holder,
+                              "rejected": True} if ok is False else {"state": "ok" if ok else "later", "by": holder})
             elif tok["refresh"] and conf["auth_keeper"]:   # it refreshes 2 h ahead: expired means it did not
                 out[name] = {"state": "lost", "why": tr("why_remote_expired"), "fix": fix, "by": holder}
             elif tok["refresh"]:
@@ -1150,6 +1151,30 @@ def programs(conf, now, out, logged, had, hub, catalog, only=None):
 
 def lost(res):
     return {n: s for n, s in res["servers"].items() if s["state"] == "lost"}
+
+
+def recheck_rejected(res, conf, now, st, hub, hub_st):
+    """One 401/403 is no loss: the access read from the store may be the one Claude Code (or conduit) replaced a moment
+    ago, a helper may have given an old header, the network may have just come back. Every server a login of which was
+    refused is asked again REJECT_PAUSE later, the credentials read anew; it stays lost only if refused again. A network
+    that shook in between: no verdict (the row is "later" and goes to the retries of settle)."""
+    names = {n for n, s in res["servers"].items() if s["state"] == "lost" and s.get("rejected")}
+    if not names:
+        return res
+    time.sleep(REJECT_PAUSE)
+    since = CALM.shaken
+    again = checkup(conf, now + REJECT_PAUSE, st, hub, hub_st, only=names)
+    steady = CALM.steady(since)
+    for n in names:
+        row = again["servers"].get(n)
+        res["servers"][n] = row if steady and row else {"state": "later", "by": res["servers"][n].get("by")}
+    res["logged"] = sorted(set(res["logged"]) | set(again["logged"]))
+    return res
+
+
+def checked(conf, now, st, hub, hub_st, only=None):
+    """checkup, and what it found refused asked once more (recheck_rejected)."""
+    return recheck_rejected(checkup(conf, now, st, hub, hub_st, only=only), conf, now, st, hub, hub_st)
 
 
 def confirmed(first, now, conf, st, hub, hub_st):
@@ -1176,7 +1201,7 @@ def calm_pass(conf, now, st, hub, hub_st):
         if not CALM.wait():
             return {"servers": {}, "later_all": True, "why": "unsettled"}
         since = CALM.shaken
-        res = checkup(conf, now, st, hub, hub_st)
+        res = checked(conf, now, st, hub, hub_st)
         if CALM.steady(since):
             done = confirmed(res, now, conf, st, hub, hub_st)
             if done is not None:
@@ -1203,7 +1228,7 @@ def settle(res, conf, now, st, hub, hub_st):
         if st.get("auto", True):
             auto_step(st, names, now, conf)
         time.sleep(RETRY_PAUSE)
-        again = checkup(conf, now + RETRY_PAUSE * (i + 1), st, hub, hub_st, only=set(names))
+        again = checked(conf, now + RETRY_PAUSE * (i + 1), st, hub, hub_st, only=set(names))
         for n in names:
             if n in again["servers"]:
                 res["servers"][n] = again["servers"][n]
@@ -1216,16 +1241,21 @@ def settle(res, conf, now, st, hub, hub_st):
     return res
 
 
+def looked_at(name, conf):
+    """cover: a server refreshed by someone else (conduit) is only shown in the view: no alarm, no reconnect."""
+    return bool(conf["cover"]) and short(name) in conf["read_only"]
+
+
 def auto_step(st, names, now, conf):
     """Auto reconnect: each server of `names` reconnected in every live session that has it, once in AUTO_EVERY;
-    never a one-time login (canva: nothing of it is touched)."""
+    never a one-time login (canva: nothing of it is touched), never a server that is only looked at (conduit, in cover)."""
     done = st.setdefault("reconnected", {})
     for n in list(done):
         if now - done[n] >= DAY:
             del done[n]
     sent = []
     for n in names:
-        if short(n) in conf["one_time"] or now - done.get(n, -DAY) < AUTO_EVERY:
+        if short(n) in conf["one_time"] or looked_at(n, conf) or now - done.get(n, -DAY) < AUTO_EVERY:
             continue
         put("mcp.reconnect", {"server": n})
         done[n] = now
@@ -1935,7 +1965,8 @@ def one_pass(now=None):
     # a login counts as "had" only on a live server: a record erased later is then told as erased
     st["had"] = sorted(set(st.get("had") or []) | {n for n in res["logged"] if servers.get(n, {}).get("state") == "ok"})
     res["dups"] = duplicates() if conf["check_duplicates"] else []
-    bad = {n: s for n, s in lost(res).items() if not s.get("unclear")}   # an alarm rests only on a clear answer
+    # an alarm rests only on a clear answer, and never on a server that is only looked at
+    bad = {n: s for n, s in lost(res).items() if not s.get("unclear") and not looked_at(n, conf)}
     st["auto"] = load_state().get("auto", st.get("auto", True))   # the owner may have switched it during the pass
     if st["auto"]:
         res["reconnected"] = auto_step(st, sorted(lost(res)), now, conf)
