@@ -114,14 +114,15 @@ default**; `check_duplicates: true` sends one line a day to the hub's developer 
   a login you started from the view) and the switch script below. Events to the hub (a message to the owner, a line to
   the feed, a reconnect request, a line to a session) go through the hub's spool folder, the way every plugin process
   posts. It never writes the credential stores or another plugin's files, and its own code never writes
-  `~/.claude.json` or `hub.json`. **Exception, only on your click on Add MCP (see below):** the programs it starts
-  then write them: `claude mcp add` writes the server into `~/.claude.json`, `hub tools import mcp` writes it into the
-  `mcp` section of `hub.json`. A short log goes to the process output, which the hub keeps in its own log.
+  `~/.claude.json` or `hub.json`. **Exception, only on your click on Add MCP or Remove (see below):** the programs it
+  starts then write them: `claude mcp add` writes the server into `~/.claude.json`, `hub tools import mcp` writes it
+  into the `mcp` section of `hub.json`, `claude mcp remove` takes a server out of `~/.claude.json`, `claude plugin
+  uninstall` takes a plugin out of the Claude Code plugins. A short log goes to the process output, which the hub keeps in its own log.
 - **Sends:** a server's own address gets one `initialize` request with the stored token (https, or localhost; no
   redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
 - **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
-  your click on **Log in**, or after **Add MCP**, and never for a server the core already waits on), `claude mcp add` and `claude mcp remove` (only for the server you
-  add: the second one takes it back if the hub refuses it), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
+  your click on **Log in**, or after **Add MCP**, and never for a server the core already waits on), `claude mcp add` and `claude mcp remove` (for the server you add: the second one takes it back if the hub refuses it;
+  and on your click on **Remove**), `claude plugin uninstall` (only on your click on **Remove**, for a plugin), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
   (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Another
   login**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
   when the server's own catalog entry names it.
@@ -214,6 +215,16 @@ Buttons of a row:
   the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
   end, then the result (done, or why not); a login that went through makes the next check start at once.
 
+- **Remove** - only on a server that lives on this machine outside the hub catalog: a server you added to Claude Code
+  yourself (`~/.claude.json`, user scope), or a server of a Claude Code plugin. A click asks first ("Remove X from this
+  machine?"; for a plugin: "Remove the plugin P with all its servers from Claude Code?"); the second click posts
+  `remove <server>` to the plugin's feed (only your own, fresh post counts, once). The process runs what you would type:
+  `claude mcp remove -s user <server>`, or `claude plugin uninstall -s user <plugin>@<marketplace>` for a plugin (the
+  whole plugin goes, with its other servers, skills and commands), checks that the server is gone and drops its row.
+  The row says "Removed" or why not. Servers of the hub catalog (`hub.json`, `mcp`), programs with no source, the
+  read-only `conduit` and a server of a project block have no button: the plugin does not write `hub.json`. Nothing
+  is deleted from disk besides what Claude Code itself removes; no login is touched.
+
 The box **Reconnect automatically** under the table (on by default; your choice is kept in `state.json`): at the start
 and on every pass a lost server is reconnected, at most once in 10 minutes per server, with a line in the
 log. A one-time login (`one_time`) is never reconnected. Only your own posts count, only for a server in the table.
@@ -253,6 +264,14 @@ add` добавляет сервер в `~/.claude.json`, `hub tools import mcp`
 вход заново), либо только со словами для сервера с ключом. Программа с необычным словом среди аргументов (ключ, символ
 оболочки) не запускается. Окно открывает только ваш клик, секретов в скрипте нет, ключи не читаются и не пишутся, новых
 адресов нет.
+
+Кнопка **Удалить** есть только у сервера, который лежит на этом компьютере вне каталога хаба: добавленного вами в Claude
+Code (`~/.claude.json`, уровень пользователя) или сервера плагина Claude Code. Первый клик спрашивает («Удалить X с
+этого компьютера?»; для плагина: «Удалить плагин P из Claude Code целиком, со всеми его серверами?»), второй кладёт в
+ленту плагина `remove <сервер>` (считается только ваш свежий пост, один раз). Процесс делает то же, что набрали бы вы:
+`claude mcp remove -s user <сервер>` или `claude plugin uninstall -s user <плагин>@<маркет>` (плагин уходит целиком),
+проверяет, что сервера больше нет, и убирает строку. Серверы каталога хаба, программы без источника, `conduit` и серверы
+блока проекта без кнопки: плагин `hub.json` не пишет.
 
 Под таблицей кнопка **Добавить MCP**: название (буквы, цифры, `-`, `_`, до 40 знаков) и адрес, который даёт сам сервис
 (`https`, `http` только для localhost, без логина, параметров и ключа). Клик кладёт в ленту плагина `add <название>

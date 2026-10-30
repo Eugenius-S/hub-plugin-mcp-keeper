@@ -162,6 +162,10 @@ STR = {
         "add_claude_failed": "Claude Code did not add the server",
         "add_hub_failed": "the hub did not take the server",
         "add_hub_busy": "the hub was busy and did not take the server: try again",
+        "remove_unknown": "this server cannot be removed from here",
+        "remove_noclaude": "Claude Code was not found",
+        "remove_failed": "Claude Code did not remove it",
+        "remove_still": "Claude Code said it was removed, but the server is still there",
     },
     "ru": {
         "why_stale": "доступ истёк {days} дн. назад, а Claude Code этот сервер не знает: хаб освежит его, когда сессия "
@@ -227,6 +231,10 @@ STR = {
         "add_claude_failed": "Claude Code не добавил сервер",
         "add_hub_failed": "хаб не принял сервер",
         "add_hub_busy": "хаб был занят и не принял сервер: попробуй ещё раз",
+        "remove_unknown": "этот сервер отсюда не удалить",
+        "remove_noclaude": "Claude Code не найден",
+        "remove_failed": "Claude Code не удалил",
+        "remove_still": "Claude Code ответил, что удалил, но сервер на месте",
     },
 }
 
@@ -1417,7 +1425,10 @@ def clean_status(data):
                             **({"can_switch": True} if r.get("can_switch") is True else {}),
                             **({"account": r["account"]} if r.get("account") in ACCOUNTS else {}),
                             **({"no_account": True} if r.get("no_account") is True else {}),
-                            **({"ignored": True} if r.get("ignored") is True else {})}
+                            **({"ignored": True} if r.get("ignored") is True else {}),
+                            **({"can_remove": r["can_remove"]} if r.get("can_remove") in ("user", "plugin") else {}),
+                            **({"plugin": r["plugin"]} if r.get("can_remove") == "plugin" and isinstance(r.get("plugin"), str)
+                               and 0 < len(r["plugin"]) <= 60 else {})}
     return {"v": 1, "at": num(data.get("at")) or 0, "every": num(data.get("every")) or EVERY,
             "auto": data.get("auto") is not False, "servers": rows}
 
@@ -1446,6 +1457,12 @@ def write_status(st):
                       **({"login": {"state": row.get("state"),
                                     **({"why": str(row["why"])[:160]} if isinstance(row.get("why"), str) and "://" not in row["why"] else {})}}
                          if isinstance(row, dict) else {})}
+    gone = login.get("removed")
+    if isinstance(gone, dict) and gone.get("state") in ("done", "fail") and now - (gone.get("at") or 0) < ADD_SHOW:
+        why = gone.get("why") if isinstance(gone.get("why"), str) and "://" not in gone["why"] else None
+        out["remove"] = {"state": gone["state"], "name": str(gone.get("name"))[:60], "at": gone.get("at"),
+                         **({"why": why[:160]} if why else {}),
+                         **({"plugin": gone["plugin"][:60]} if isinstance(gone.get("plugin"), str) else {})}
     write_json(status_path(), out)
 
 
@@ -1510,7 +1527,8 @@ def view_row(n, s, ok_at, logged=(), servers=None, core=()):
                str(s.get("fix") or "").startswith("hub mcp login ") else {}),
             **({"can_switch": True, "account": kind} if s["state"] == "ok" and kind in ACCOUNTS else {}),
             **({"no_account": True} if kind == "none" else {}),
-            **({"ignored": True} if s.get("ignored") else {})}
+            **({"ignored": True} if s.get("ignored") else {}),
+            **removal_fields(n)}
 
 
 def post_status(st, res, conf, now, hub_st=None):
@@ -1723,6 +1741,64 @@ IMPORT_PAUSE = 5          # seconds between those tries
 BUSY = re.compile(r"PermissionError|WinError (?:5|32)|Access is denied|used by another process|Permission denied|EBUSY|"
                   r"resource busy|locked", re.I)
 ADD_SHOW = 3600           # the result of an add stays under the table this long
+PLUGIN_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}@[A-Za-z0-9][A-Za-z0-9_.-]{0,59}")
+
+
+def removal(name):
+    """Remove (0.11.0): ("user", name, None) - a server of ~/.claude.json (user scope) that only this machine has; ("plugin",
+    <plugin>@<market>, <plugin>) - a server of an enabled Claude Code plugin installed for the user (the whole plugin
+    goes); None - no button: a hub catalog server (the hub owns it), a project one, one another part of the hub refreshes
+    (read only), anything that is not in the sources."""
+    name = str(name)
+    if name.startswith("plugin:"):
+        plugin = name.split(":", 2)[1]
+        if name not in plugin_servers():
+            return None
+        d = claude_dir()
+        inst = (read_json(os.path.join(d, "plugins", "installed_plugins.json")) or {}).get("plugins") or {}
+        for key, recs in inst.items() if isinstance(inst, dict) else []:
+            if key.split("@", 1)[0] == plugin and PLUGIN_KEY.fullmatch(key) and isinstance(recs, list) and \
+                    any(isinstance(r, dict) and r.get("scope") == "user" for r in recs):
+                return "plugin", key, plugin
+        return None
+    cj = read_json(claude_json()) or {}
+    top = cj.get("mcpServers") if isinstance(cj.get("mcpServers"), dict) else {}
+    if not ADD_NAME.fullmatch(name) or not isinstance(top.get(name), dict) or name in catalog_servers() or \
+            short(name) in settings()["read_only"]:
+        return None
+    if any(isinstance(p, dict) and isinstance(p.get("mcpServers"), dict) and name in p["mcpServers"]
+           for p in (cj.get("projects") or {}).values()):
+        return None   # the same name in a project: `-s user` would leave the picture half done
+    return "user", name, None
+
+
+def removal_fields(name):
+    plan = removal(name)
+    return {"can_remove": plan[0], **({"plugin": plan[2]} if plan[2] else {})} if plan else {}
+
+
+def remove_server(name, now, run=None):
+    """The "Remove" button: `claude mcp remove -s user <name>` or `claude plugin uninstall -s user <plugin>@<market>` and
+    nothing else, then the source is read again - Claude Code said ok and the server is still there is a failure. The row
+    of the table goes away; the next pass does not bring it back, because it reads the same sources. -> the removed row."""
+    run = run or run_limited
+    plan = removal(name)
+    fail = lambda why: {"state": "fail", "name": name[:60], "at": now, "why": why,
+                        **({"plugin": plan[2]} if plan and plan[2] else {})}
+    if not plan:
+        return fail(tr("remove_unknown"))
+    claude = claude_cmd()
+    if not claude:
+        return fail(tr("remove_noclaude"))
+    kind, target, plugin = plan
+    got = run(claude + (["plugin", "uninstall", "-s", "user", target] if kind == "plugin" else
+                        ["mcp", "remove", "-s", "user", target]), ADD_RUN)
+    if got is None or got[0] != 0:
+        return fail(tr("remove_failed") + (": " + last_line(got[1]) if got and last_line(got[1]) else ""))
+    if name in cover_servers() or name in plugin_servers() or name in user_servers():
+        return fail(tr("remove_still"))
+    print(time.strftime("%H:%M:%S"), "mcp-keeper: removed", name, flush=True)
+    return {"state": "done", "name": name[:60], "at": now, **({"plugin": plugin} if plugin else {})}
 
 
 def last_line(out, size=160):
@@ -1779,12 +1855,12 @@ def add_server(name, url, hub_st, now, run=None):
     return {"state": "done", "name": name, "at": now}
 
 
-CLICK = re.compile(r"(login|reconnect|switch) (\S{1,128})|auto (on|off)|add (\S{1,64}) (\S{1,512})")
+CLICK = re.compile(r"(login|reconnect|switch|remove) (\S{1,128})|auto (on|off)|add (\S{1,64}) (\S{1,512})")
 
 
 def clicks(hub_st, after, now):
     """[(seq, act, arg)] - the owner's posts of the plugin channel after seq `after`, not older than LOGIN_FRESH:
-    "login <server>", "reconnect <server>", "switch <server>", "add <name> <address>", "auto on|off"; the second item is the highest seq seen. Only the owner's
+    "login <server>", "reconnect <server>", "switch <server>", "remove <server>", "add <name> <address>", "auto on|off"; the second item is the highest seq seen. Only the owner's
     word counts (a session posts there too)."""
     out, top = [], after
     for p in hub_st.get("feeds", {}).get(NAME) or []:
@@ -1842,6 +1918,19 @@ def login_step(now=None, run=None, hub_st=None, opener=None):
                 elif probe_open(url) is not True:   # one that answers without a login has nothing to log in to
                     rows[name] = login_start(name, hub_st, now, run)
                 RECHECK_NOW.set()   # the new server joins the table at the next pass
+            changed = True
+            continue
+        if act == "remove":
+            data["removed"] = remove_server(server, now, run)
+            if data["removed"]["state"] == "done":
+                gone = {server} | ({n for n in known if n.startswith("plugin:%s:" % data["removed"]["plugin"])}
+                                   if data["removed"].get("plugin") else set())
+                st = load_state()
+                for n in gone:
+                    ((st.get("status") or {}).get("servers") or {}).pop(n, None)
+                    rows.pop(n, None)
+                save_state(st)
+                RECHECK_NOW.set()
             changed = True
             continue
         if act == "auto":

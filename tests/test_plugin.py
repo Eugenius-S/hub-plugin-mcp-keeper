@@ -1588,6 +1588,129 @@ class ViewAdd(Base):
         self.assertEqual(self.before, (read(os.environ["HUB_CONFIG"], raw=True), os.path.exists(main.claude_json())))
 
 
+class ViewRemove(Base):
+    """0.11.0 "Remove": the owner's post "remove <server>" -> `claude plugin uninstall` for a server of a Claude Code plugin,
+    `claude mcp remove -s user` for one of ~/.claude.json. A hub catalog server, a project one and a read-only one have no
+    button. Every command is a fake here: nothing is removed from a real machine."""
+
+    PLUG = os.path.join(TMP, "plug")
+
+    def setUp(self):
+        super().setUp()
+        self.config({}, plugin={"cover": True})
+        write(main.claude_json(), {"mcpServers": {
+            "gate": {"type": "http", "url": "https://gate.example/mcp"},
+            "conduit": {"type": "http", "url": "https://conduit.example/mcp"},
+            "figma": {"type": "http", "url": URLS["figma"]}},
+            "projects": {"/work/x": {"mcpServers": {"proj": {"type": "http", "url": "https://proj.example/mcp"}}}}})
+        write(os.path.join(self.PLUG, ".mcp.json"), {"mcpServers": {"pen": {"type": "http", "url": "https://pen.example/mcp"}}})
+        write(os.path.join(TMP, "claude", "settings.json"), {"enabledPlugins": {"draw@market": True}})
+        write(os.path.join(TMP, "claude", "plugins", "installed_plugins.json"),
+              {"version": 2, "plugins": {"draw@market": [{"scope": "user", "installPath": self.PLUG}]}})
+        self.ran, self.answers = [], {}
+        self.hub["feeds"] = {main.NAME: []}
+        for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
+                  mock.patch.object(main, "claude_cmd", lambda: ["/bin/claude"]),
+                  mock.patch.object(main, "probe_open", lambda url: False),
+                  mock.patch.object(main, "run_limited", self.fake_run)):
+            p.start()
+            self.addCleanup(p.stop)
+        main.RECHECK_NOW.clear()
+        self.run_once()
+
+    def fake_run(self, cmd, timeout, merge=True):
+        self.ran.append(cmd)
+        got = self.answers.get(cmd[1:3][0] if cmd[1:3][:1] == ["plugin"] else "mcp")
+        if got is not None:
+            return got
+        if cmd[1:3] == ["plugin", "uninstall"]:   # what Claude Code does to the files
+            write(os.path.join(TMP, "claude", "settings.json"), {"enabledPlugins": {}})
+        elif cmd[1:3] == ["mcp", "remove"]:
+            cj = read(main.claude_json())
+            cj["mcpServers"].pop(cmd[-1], None)
+            write(main.claude_json(), cj)
+        return 0, "ok\n"
+
+    def post(self, seq, text, by="owner", ts=NOW):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text, "ts": ts})
+
+    def rows(self):
+        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
+
+    def test_which_rows_get_the_button(self):
+        rows = self.rows()
+        self.assertEqual(rows["gate"].get("can_remove"), "user")
+        self.assertEqual(rows["plugin:draw:pen"].get("can_remove"), "plugin")
+        self.assertEqual(rows["plugin:draw:pen"].get("plugin"), "draw")
+        for name in ("figma", "conduit", "proj"):   # the hub catalog, read only, a project one
+            if name in rows:
+                self.assertNotIn("can_remove", rows[name], name)
+        self.assertIn("figma", rows)
+        self.assertIn("conduit", rows)
+
+    def test_a_user_server_goes_with_claude_mcp_remove(self):
+        self.post(1, "remove gate")
+        self.assertTrue(main.login_step(NOW + 1))
+        self.assertEqual(self.ran, [["/bin/claude", "mcp", "remove", "-s", "user", "gate"]])
+        out = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertEqual((out["remove"]["state"], out["remove"]["name"]), ("done", "gate"))
+        self.assertNotIn("gate", out["servers"])
+        self.assertTrue(main.RECHECK_NOW.is_set())
+
+    def test_a_plugin_server_takes_the_whole_plugin_with_it(self):
+        self.post(1, "remove plugin:draw:pen")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [["/bin/claude", "plugin", "uninstall", "-s", "user", "draw@market"]])
+        out = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertEqual((out["remove"]["state"], out["remove"]["plugin"]), ("done", "draw"))
+        self.assertNotIn("plugin:draw:pen", out["servers"])
+
+    def test_no_button_means_no_command(self):
+        for i, name in enumerate(("figma", "conduit", "proj", "nosuch", "plugin:draw:other"), 1):
+            self.post(i, "remove " + name)
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        out = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertEqual(out["remove"]["state"], "fail")
+        self.assertIn("figma", self.rows())
+
+    def test_an_old_a_foreign_and_a_second_click_do_nothing(self):
+        self.post(1, "remove gate", ts=NOW - main.LOGIN_FRESH - 5)
+        self.post(2, "remove gate", by="worker")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        self.post(3, "remove gate")
+        main.login_step(NOW + 2)
+        main.login_step(NOW + 3)
+        self.assertEqual(len(self.ran), 1)
+
+    def test_a_command_that_fails_leaves_the_row_and_says_why(self):
+        self.answers["mcp"] = (1, "no such server\n")
+        self.post(1, "remove gate")
+        main.login_step(NOW + 1)
+        out = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertEqual((out["remove"]["state"], out["remove"]["why"].endswith("no such server")), ("fail", True))
+        self.assertIn("gate", out["servers"])
+
+    def test_the_server_does_not_come_back_at_the_next_pass(self):
+        self.post(1, "remove gate")
+        main.login_step(NOW + 1)
+        self.post(2, "remove plugin:draw:pen")
+        main.login_step(NOW + 2)
+        names = self.run_once(NOW + 3000)["servers"]
+        self.assertNotIn("gate", names)
+        self.assertNotIn("plugin:draw:pen", names)
+        self.assertNotIn("gate", self.rows())
+
+    def test_a_command_that_did_nothing_is_a_failure(self):
+        self.answers["mcp"] = (0, "ok\n")   # said ok, the entry is still there
+        self.answers["plugin"] = (0, "ok\n")
+        self.post(1, "remove gate")
+        self.post(2, "remove plugin:draw:pen")
+        main.login_step(NOW + 1)
+        self.assertEqual(read(os.environ["MCP_KEEPER_STATUS"])["remove"]["state"], "fail")
+
+
 class Icon(unittest.TestCase):
     """The menu draws a view icon with a mask: one colour, no background; icon.png is the cover of the market."""
 
@@ -2159,7 +2282,7 @@ class CoreWaits(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.10.0")
+        self.assertEqual(m["version"], "0.11.0")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -2367,6 +2490,61 @@ class ViewAddForm(unittest.TestCase):
         add["login"] = {"state": "fail", "why": "the browser was closed"}
         got = self.run_view([], {"add": add})
         self.assertTrue(got["texts"]["mk-add-login"].endswith(": the browser was closed"))
+
+
+VIEW_REMOVE = VIEW_ADD.replace('startsWith("mk-add")', 'startsWith("mk-remove")')
+
+
+class ViewRemoveButton(unittest.TestCase):
+    """0.11.0: the "Remove" button asks first, the second click posts "remove <server>"; run in node with a stub hub."""
+
+    def run_view(self, steps, servers, extra=None):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("no node")
+        arg = {"steps": steps, "extra": dict(extra or {}, servers=servers)}
+        got = subprocess.run([node, "--input-type=module", "-e", VIEW_REMOVE, os.path.join(ROOT, "main.js"), json.dumps(arg)],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        return json.loads(got.stdout)
+
+    USER = {"newsvc": {"state": "ok", "title": "Newsvc", "can_remove": "user"}}
+    PLUGIN = {"plugin:draw:pen": {"state": "ok", "title": "Pen", "can_remove": "plugin", "plugin": "draw"}}
+
+    def test_a_row_without_can_remove_has_no_button(self):
+        got = self.run_view([], {"figma": {"state": "ok", "title": "Figma", "can_switch": True}})
+        self.assertNotIn("mk-remove", got["classes"])
+
+    def test_the_first_click_only_asks(self):
+        got = self.run_view([{"click": "mk-remove"}], self.USER)
+        self.assertEqual(got["posts"], [])
+        self.assertEqual(got["texts"]["mk-remove-q"], "Remove Newsvc from this machine?")
+        self.assertTrue({"mk-remove-go", "mk-remove-cancel"} <= set(got["classes"]))
+        self.assertNotIn("mk-remove", got["classes"])
+
+    def test_the_second_click_posts_one_remove(self):
+        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-go"}], self.USER)
+        self.assertEqual(got["posts"], ["remove newsvc"])
+        self.assertEqual(got["texts"].get("mk-remove-q"), None)
+
+    def test_cancel_brings_the_button_back_and_posts_nothing(self):
+        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-cancel"}], self.USER)
+        self.assertEqual(got["posts"], [])
+        self.assertIn("mk-remove", got["classes"])
+        self.assertNotIn("mk-remove-go", got["classes"])
+
+    def test_a_plugin_says_the_whole_plugin_goes(self):
+        got = self.run_view([{"click": "mk-remove"}], self.PLUGIN)
+        self.assertIn("plugin draw with all its servers", got["texts"]["mk-remove-q"])
+        got = self.run_view([{"click": "mk-remove"}, {"click": "mk-remove-go"}], self.PLUGIN)
+        self.assertEqual(got["posts"], ["remove plugin:draw:pen"])
+
+    def test_the_answer_of_the_process_is_shown(self):
+        got = self.run_view([], {}, {"remove": {"state": "done", "name": "newsvc", "at": 5}})
+        self.assertEqual(got["texts"]["mk-removed"], "Removed: newsvc")
+        got = self.run_view([], {}, {"remove": {"state": "fail", "name": "newsvc", "at": 5, "why": "claude failed"}})
+        self.assertEqual(got["texts"]["mk-removed"], "Not removed: newsvc (claude failed)")
 
 
 class JsStrings(unittest.TestCase):

@@ -1,12 +1,12 @@
 {
   "name": "mcp-keeper",
   "icon": "icon.png",
-  "description": "Finds a lost login to a service connected to your agents before the work stops, and warns you once. Checks every 15 minutes. The tab lists each service: connected or lost, and when it was last connected. Buttons: Another login, Reconnect, Log in (a hub with its own login strip keeps that one).",
+  "description": "Finds a lost login to a service connected to your agents before the work stops, and warns you once. Checks every 15 minutes. The tab lists each service: connected or lost, and when it was last connected. Buttons: Another login, Reconnect, Log in, Add MCP, Remove (asks first).",
   "why": "You hear about a lost login from the plugin, not from stalled work: within 15 minutes, once, with a hint how to log in",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "i18n": {
     "ru": {
-      "description": "Находит слетевший вход в сервис раньше, чем встанет работа, и один раз предупреждает вас. Проверяет раз в 15 минут. Вкладка показывает каждый сервис: подключён или отвалился, когда был подключён. Кнопки: «Другой логин», «Переподключить», «Войти» (если у хаба есть своя полоса входа, вход делает она).",
+      "description": "Находит слетевший вход в сервис раньше, чем встанет работа, и один раз предупреждает вас. Проверяет раз в 15 минут. Вкладка показывает каждый сервис: подключён или отвалился, когда был подключён. Кнопки: «Другой логин», «Переподключить», «Войти», «Добавить MCP», «Удалить» (сначала спросит).",
       "why": "О слетевшем входе вы узнаёте от плагина, а не от вставшей работы: в течение 15 минут, один раз, с подсказкой, как войти"
     }
   },

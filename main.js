@@ -19,6 +19,9 @@ const STR = {
     add_hint: "The service gives the name and the address. A key is not typed here: you log in in the browser.",
     add_bad: "Check the name (letters, digits, - and _) and the address (https, no key or parameters in it)",
     add_sent: "adding…", add_ok: "Added: {name}", add_fail: "Not added", add_restart: "Sessions get it after they restart.",
+    remove: "Remove", remove_go: "Remove", remove_cancel: "Cancel", remove_sent: "removing…",
+    remove_ask: "Remove {name} from this machine?", remove_ask_plugin: "Remove the plugin {plugin} with all its servers from Claude Code?",
+    remove_ok: "Removed: {name}", remove_ok_plugin: "Removed the plugin {plugin} with {name}", remove_fail: "Not removed",
   },
   ru: {
     title: "Входы MCP", subtitle: "MCP-серверы хаба, проверка раз в {n} мин",
@@ -38,6 +41,9 @@ const STR = {
     add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь в браузере.",
     add_bad: "Проверь название (буквы, цифры, - и _) и адрес (https, без ключа и параметров)",
     add_sent: "добавляю…", add_ok: "Добавлено: {name}", add_fail: "Не добавлено", add_restart: "Сессии получат его после перезапуска.",
+    remove: "Удалить", remove_go: "Удалить", remove_cancel: "Отмена", remove_sent: "удаляю…",
+    remove_ask: "Удалить {name} с этого компьютера?", remove_ask_plugin: "Удалить плагин {plugin} из Claude Code целиком, со всеми его серверами?",
+    remove_ok: "Удалено: {name}", remove_ok_plugin: "Удалён плагин {plugin} вместе с {name}", remove_fail: "Не удалено",
   },
 };
 const ORDER = { lost: 0, first: 1, ok: 3, skip: 4 };
@@ -47,6 +53,7 @@ let hub;
 let last = { id: 0, at: 0, data: null, snap: null };
 const sent = {};   // server -> {at, act}: the row says what was asked until the process answers
 const SENT_FOR = 20000;
+const asking = new Set();   // servers whose "Remove" waits for a confirmation: nothing goes out before the second click
 const form = { open: false, name: "", url: "", bad: false, at: 0, focus: "" };   // "Add MCP": what is typed survives a redraw
 const NAME_OK = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
 const URL_OK = /^(https:\/\/[A-Za-z0-9.-]{1,200}(:\d{1,5})?|http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?)(\/[A-Za-z0-9._~%+/-]{0,200})?$/;   // like the process: no login, query or key
@@ -121,6 +128,35 @@ function button(cls, label, text, name, act, td) {
 // The actions of a row: "Another login" for a connected server with a login of its own (the process opens a
 // terminal where the login is changed), "Reconnect" (the server reconnects in every running session, no login) for a lost
 // one, "Log in" / "Log in again" (the process runs `hub mcp login`) where a login can help; or what is going on now.
+// "Remove": the first click asks (a plugin goes whole, with its other servers), the second posts "remove <server>"; the
+// process runs the Claude Code command and says how it went in data.remove. Servers of the hub's catalog have no button.
+function removeButton(name, s, td) {
+  if (!asking.has(name)) {
+    const btn = hub.el("button", "btn mk-remove", tr("remove"));
+    btn.type = "button";
+    btn.onclick = () => { asking.add(name); draw(root_); };
+    return btn;
+  }
+  const box = hub.el("div", "mk-remove-ask");
+  box.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center";
+  const q = hub.el("span", "mk-remove-q", s.can_remove === "plugin" ? tr("remove_ask_plugin", { plugin: s.plugin || name }) : tr("remove_ask", { name: s.title || name }));
+  q.style.cssText = "white-space:normal;max-width:22em";
+  const go = hub.el("button", "btn mk-remove-go", tr("remove_go"));
+  go.type = "button";
+  go.onclick = () => {
+    asking.delete(name);
+    sent[name] = { at: Date.now(), act: "remove" };
+    hub.postFeed("remove " + name);
+    td.replaceChildren(hub.el("span", "", tr("remove_sent")));
+    setTimeout(() => load(null, true).then(() => draw(root_)).catch(() => {}), 6000);
+  };
+  const cancel = hub.el("button", "btn mk-remove-cancel", tr("remove_cancel"));
+  cancel.type = "button";
+  cancel.onclick = () => { asking.delete(name); draw(root_); };
+  box.append(q, go, cancel);
+  return box;
+}
+
 function actionCell(row, name, s) {
   const td = hub.el("td");
   td.style.cssText = "padding:6px 8px;border-top:1px solid rgba(127,127,127,.2);white-space:nowrap";
@@ -129,10 +165,13 @@ function actionCell(row, name, s) {
   const re = l.act === "reconnect";
   const sw = l.act === "switch";
   const busy = (re && l.state === "sent") || (!re && !sw && l.state === "wait");
-  const asked = sent[name] && mine(name) && !(l.at && l.at * 1000 >= sent[name].at && l.state !== "sent" && l.state !== "wait");
+  const rm = (last.data && last.data.remove) || {};
+  const removing = sent[name] && sent[name].act === "remove";
+  const asked = sent[name] && mine(name) &&
+    !(removing ? rm.at && rm.at * 1000 >= sent[name].at : l.at && l.at * 1000 >= sent[name].at && l.state !== "sent" && l.state !== "wait");
   if (busy || asked) {
     const act = asked ? sent[name].act : re ? "reconnect" : "login";
-    td.textContent = tr(act === "reconnect" ? "reconnect_sent" : act === "switch" ? "switch_sent" : l.state === "wait" ? "login_wait" : "login_sent");
+    td.textContent = tr(act === "remove" ? "remove_sent" : act === "reconnect" ? "reconnect_sent" : act === "switch" ? "switch_sent" : l.state === "wait" ? "login_wait" : "login_sent");
     td.style.opacity = ".8";
     return;
   }
@@ -158,6 +197,7 @@ function actionCell(row, name, s) {
     hint.style.cssText = "opacity:.7;font-size:.9em;align-self:center";
     bar.append(hint);
   }
+  if (s.can_remove) bar.append(removeButton(name, s, td));
   if (bar.firstChild) td.append(bar);
   else if (s.no_account) {
     const grey = hub.el("span", "mk-noacc", tr("no_account"));
@@ -232,6 +272,18 @@ function addBox(d) {
   return wrap;
 }
 
+// how the last "Remove" went: the row is gone on success, so the line is the only trace of it
+function removedLine(d) {
+  const rm = d.remove;
+  if (!rm) return hub.el("span");
+  const ok = rm.state === "done";
+  const text = ok ? (rm.plugin ? tr("remove_ok_plugin", { plugin: rm.plugin, name: rm.name }) : tr("remove_ok", { name: rm.name })) :
+    tr("remove_fail") + ": " + rm.name + (rm.why ? " (" + rm.why + ")" : "");
+  const line = hub.el("div", ok ? "mk-done mk-removed" : "mk-fail mk-removed", text);
+  line.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-top:10px;white-space:normal";
+  return line;
+}
+
 function autoBox(d) {
   const label = hub.el("label", "mk-auto");
   label.style.cssText = "display:flex;gap:8px;align-items:center;margin-top:14px;cursor:pointer";
@@ -275,7 +327,7 @@ function draw(root) {
     th.style.cssText = "text-align:left;padding:6px 8px;opacity:.7;font-weight:500";
     head.append(th);
   }
-  const acts = (s) => s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
+  const acts = (s) => s.can_remove || s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
   const withActs = shown.some(([, s]) => acts(s));
   if (withActs) head.append(hub.el("th"));
   table.append(head);
@@ -303,6 +355,7 @@ function draw(root) {
     note.style.cssText = "margin:10px 0 0;opacity:.6;font-size:.9em";
     wrap.append(note);
   }
+  wrap.append(removedLine(d));
   wrap.append(addBox(d));
   wrap.append(autoBox(d));
   root.append(wrap);
