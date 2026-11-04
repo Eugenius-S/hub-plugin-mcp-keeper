@@ -62,8 +62,8 @@ network without sleep (the idle loop looks at the clock every 30 s, at the netwo
   session uses right now), each with `hub mcp login <hub session> <server>`. Lifted when a check sees the server live.
 - Sessions that work with a lost server right now get one line (once per loss): do not loop on its tools.
 - A server never logged in is never an alarm. When sessions wait for its login, the view shows it as "never logged
-  in" and the Hub Developer gets one line a day with one `hub mcp login` per server (one login is enough for every
-  session).
+  in" and the Hub Developer gets one line with one `hub mcp login` per server, once per server (again after 14 days
+  while it stays so; 0.12.0 - it was every day, and each line woke the session for nothing).
 
 ## Cover: every login of the machine (off by default)
 
@@ -84,10 +84,11 @@ the watch from what the hub gives its sessions to every MCP server of this machi
 
 `mcp_auth_ignore` and `ignore` hold. A server under a second name (the same address or package) is checked once.
 
-The alarm has steps with `cover`: the first sign of a lost login goes at once to the Hub Developer (`hub send`, what
-is seen, who holds it, the fix; not again within a day); the owner gets the urgent message only when
+The alarm has steps with `cover`: the first sign of a lost login goes at once to the plugin's log (what is seen, who
+holds it, the fix; not again within a day) and wakes nobody (0.12.0; it used to message the Hub Developer, who could do
+nothing before the owner is told); the owner gets the urgent message only when
 `owner_after_passes` (2, about 30 min) more passes still see it lost, then at most one alarm per server a day. A pass
-that cannot tell ("later") neither counts nor resets. A login auth-keeper holds goes to the Hub Developer only:
+that cannot tell ("later") neither counts nor resets. A login auth-keeper holds is only logged:
 auth-keeper tells the owner itself.
 
 ## Refreshing ahead
@@ -101,7 +102,7 @@ minute, out of the lock) repeats a refresh token, and a one-time one is then rev
 
 A user server in `~/.claude.json` with the address of a plugin's server hides the plugin's one from Claude Code
 (the login under `plugin:...` is never refreshed). It touches only Claude Code outside the hub, so it is **off by
-default**; `check_duplicates: true` sends one line a day to the hub's developer session.
+default**; `check_duplicates: true` sends one line per duplicate to the hub's developer session (again after 14 days).
 
 ## What it reads, writes and sends
 

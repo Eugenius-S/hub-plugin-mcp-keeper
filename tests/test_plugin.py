@@ -1,5 +1,5 @@
 """mcp-keeper: no real claude, network or keychain - a fake `claude` script, a credentials file and patched probes."""
-import http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
+import contextlib, io, http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -864,7 +864,7 @@ class FirstLogin(Base):
         self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
         self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
 
-    def test_first_is_shown_and_told_to_the_developer_once_a_day(self):
+    def test_first_is_shown_and_told_to_the_developer_once_per_name(self):
         res = self.run_once()
         self.assertEqual(res["servers"]["mobbin"]["state"], "first")
         self.assertEqual(self.notes(), [])
@@ -874,8 +874,21 @@ class FirstLogin(Base):
         self.run_once(NOW + 3600)
         self.assertEqual(self.dev(), [])
         self.run_once(NOW + 86400 + 60)
-        self.assertEqual(len(self.dev()), 1)
+        self.assertEqual(self.dev(), [], "a day later the same list is not said again (0.12.0)")
+        self.run_once(NOW + 13 * 86400)
+        self.assertEqual(self.dev(), [])
+        self.run_once(NOW + 14 * 86400 + 60)
+        self.assertEqual(len(self.dev()), 1, "still never logged in after 14 days: one reminder")
         self.assertEqual(read(os.environ["MCP_KEEPER_STATUS"])["servers"]["mobbin"]["state"], "first")
+
+    def test_a_server_that_flaps_out_of_first_is_not_told_again(self):
+        self.run_once()
+        self.assertEqual(len(self.dev()), 1)
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []   # nobody waits for it for a while
+        self.run_once(NOW + 900)
+        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
+        self.run_once(NOW + 1800)
+        self.assertEqual(self.dev(), [], "back in first after a gap: the Hub Developer already knows")
 
     def test_nobody_waits_nothing_is_said(self):
         self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
@@ -1135,12 +1148,15 @@ class Cover(Base):
         self.assertEqual(s["state"], "ok")
         self.silent("gate")
 
-    def test_rejected_twice_is_lost_and_told(self):
+    def test_rejected_twice_is_lost_and_logged_not_told(self):
         self.gate()
         self.probes["https://gate.example/mcp"] = (False, 401)
-        s = self.run_once()["servers"]["gate"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            s = self.run_once()["servers"]["gate"]
         self.assertEqual(s["state"], "lost")
-        self.assertIn("gate (claude)", " ".join(d["text"] for d in self.dev()))
+        self.assertIn("gate (claude)", out.getvalue())
+        self.assertNotIn("gate", " ".join(d["text"] for d in self.dev()))
         self.assertEqual(self.reconnects("gate"), ["gate"])
 
     def test_the_second_look_waits_a_minute(self):
@@ -1197,12 +1213,16 @@ class Cover(Base):
             self.assertEqual(self.notes(), [], i)
         self.assertEqual((s["state"], s["by"]), ("lost", "auth-keeper"))
 
-    def test_ladder_developer_first_owner_after_two_more_passes(self):
+    def test_ladder_log_first_owner_after_two_more_passes(self):
         self.gate()
         self.probes["https://gate.example/mcp"] = (False, 401)
-        self.run_once()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_once()
+        self.assertIn("gate (claude)", out.getvalue())
         self.assertEqual(self.notes(), [])
-        self.assertIn("gate (claude)", self.dev()[0]["text"])
+        self.assertEqual([d for d in self.dev() if "gate" in d["text"]], [],
+                         "the first sign wakes nobody: a log line (0.12.0, d505475)")
         self.run_once(NOW + 900)
         self.assertEqual((self.notes(), self.dev()), ([], []))
         self.run_once(NOW + 1800)

@@ -25,8 +25,9 @@ CONFIRM_AFTER seconds later sees it too.
 To the owner: one urgent message per pass with the servers that are newly lost. One alarm per server per day, kept on
 disk: it is repeated only after the server was seen live and was lost again, and never within a day of the last one; the
 whole plugin says at most `max_alarms` a day. Sessions that work with a lost server get one line.
-Never a server never logged in (state "first" when sessions wait for it: one line a day to the Hub Developer) and
-never a duplicate unless `check_duplicates` is on.
+Never a server never logged in (state "first" when sessions wait for it: one line to the Hub Developer per name, again
+after 14 days while it stays so) and never a duplicate unless `check_duplicates` is on. The Hub Developer is woken only by
+what needs an answer or an action: a first login to ask the owner for; the first sign of a loss goes to the log.
 
 Out: the fact ext.<name>.checked, owner.notify (urgent - a quiet Telegram summary would swallow it), a short message
 to the sessions that are working with this server right now, and the status in the plugin's channel (for its view).
@@ -38,7 +39,7 @@ cover (off by default; true or a list of machine names): every MCP server of thi
 ~/.claude.json, enabled plugins - each with its holder (by): claude, headers, conduit (read only: the hub's conduit
 module refreshes it, a parallel refresh kills the pair), mcp-remote / auth-keeper (stdio with mcp-remote: its stored
 login in ~/.mcp-auth is read, never exchanged), program (any other stdio: skipped, never started), local, none. A loss
-then goes at once to the Hub Developer (hub send), to the owner only after owner_after_passes (2) more passes, never one
+then goes at once to the log (stdout; the Hub Developer is not woken), to the owner only after owner_after_passes (2) more passes, never one
 auth-keeper holds (it tells the owner itself). Refreshing ahead is not done: `claude mcp get` does not refresh a live
 access, Claude Code keeps the login itself under mcp-refresh-*.lock.
 
@@ -56,6 +57,8 @@ NOTE_ID = "mcp"
 DAY = 24 * 3600
 ONE_TIME = ("canva",)     # servers whose refresh token works once: a lost exchange loses the login
 EVERY = 15                # minutes between passes
+REMIND_DAYS = 14         # a never-logged-in server or a duplicate is told to the Hub Developer once, again after so many days
+FORGET_DAYS = 30          # ... and forgotten when it has not been seen for so long
 MAX_ALARMS = 6            # messages to the owner a day, the whole plugin
 START_DELAY = 60          # first pass after a start: the hub restarts in batches
 AGAIN_AFTER = 600         # the process was restarted - a pass not more often than this
@@ -2128,13 +2131,16 @@ def one_pass(now=None):
         res["sessions"] = tell_sessions(order(names, conf, use, ok_at), use, st, now)
     elif resolve:
         put("owner.notify_resolved", {"id": NOTE_ID})
-    # a duplicate blocks no work: one line a day to the Hub Developer, not to the owner
-    if remember(st, "told_dup", sorted(d["name"] for d in res["dups"]), now, set()) == "tell":
+    # a duplicate blocks no work, never logged in is no loss (owner 22.10): both go to the Hub Developer, but each name once
+    # (again after REMIND_DAYS while it stays so): the same list every day woke it for nothing (0.12.0, d505475)
+    dups = said(st, "said_dup", sorted(d["name"] for d in res["dups"]), now)
+    if dups:
         res["developer"] = developer(hub_st)
-        put("message.received", {"to": res["developer"], "text": message({}, res["dups"], conf, use, ok_at)})
-    # never logged in is no loss (owner 22.10): one line a day to the Hub Developer, who asks the owner for one login
+        put("message.received", {"to": res["developer"],
+                                 "text": message({}, [d for d in res["dups"] if d["name"] in dups], conf, use, ok_at)})
     first = sorted(n for n, s in servers.items() if s["state"] == "first" and n not in core)   # the core's strip has its own
-    if remember(st, "told_never", first, now, set()) == "tell":
+    first = said(st, "said_never", first, now)
+    if first:   # the Hub Developer asks the owner for one login
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"], "text": "\n".join(
             [tr("first", names=", ".join(first))] + [tr("first_line_fix", name=n, fix=servers[n].get("fix") or
@@ -2144,7 +2150,7 @@ def one_pass(now=None):
 
 
 def ladder(st, servers, bad, conf, now, hub_st, res):
-    """cover: a lost login goes to the Hub Developer at once (what is seen, the holder, the fix; again not within a day),
+    """cover: a lost login goes to the log at once (what is seen, the holder, the fix; again not within a day),
     to the owner only after `owner_after` more passes still see it lost, never one auth-keeper holds (it tells the owner
     itself). A pass that cannot tell (unclear) neither counts nor resets. Returns the servers for the owner's alarm."""
     streak, warned = st.setdefault("streak", {}), st.setdefault("dev_warned", {})
@@ -2157,15 +2163,27 @@ def ladder(st, servers, bad, conf, now, hub_st, res):
     for n in bad:
         streak[n] = streak.get(n, 0) + 1
     new = sorted(n for n in bad if now - warned.get(n, -DAY) >= DAY)
-    if new:
-        res["developer"] = developer(hub_st)
-        put("message.received", {"to": res["developer"], "text": "\n".join(
-            [tr("dev", passes=conf["owner_after"])] +
-            [tr("dev_line", name=n, by=bad[n].get("by") or "-", why=bad[n].get("why") or "-", fix=bad[n].get("fix") or "-")
-             for n in new])})
+    if new:   # the first sign is not for waking anyone: a log line; the owner's alarm comes after owner_after more passes
+        print(time.strftime("%H:%M:%S"), "mcp-keeper:", tr("dev", passes=conf["owner_after"]), "; ".join(
+            tr("dev_line", name=n, by=bad[n].get("by") or "-", why=bad[n].get("why") or "-", fix=bad[n].get("fix") or "-")
+            for n in new), flush=True)
         for n in new:
             warned[n] = now
     return {n: s for n, s in bad.items() if streak[n] > conf["owner_after"] and s.get("by") != "auth-keeper"}
+
+
+def said(st, key, names, now):
+    """The names not yet said to the Hub Developer (or said more than REMIND_DAYS ago); marks them said. A name stays
+    remembered while it comes back within FORGET_DAYS, so a server that flaps in and out is not told again each time."""
+    book = st.setdefault(key, {})
+    for n in names:
+        book.setdefault(n, {"at": -REMIND_DAYS * DAY})["seen"] = now
+    for n in [n for n, v in book.items() if now - v.get("seen", 0) >= FORGET_DAYS * DAY]:
+        del book[n]
+    due = [n for n in names if now - book[n]["at"] >= REMIND_DAYS * DAY]
+    for n in due:
+        book[n]["at"] = now
+    return due
 
 
 def developer(st):
