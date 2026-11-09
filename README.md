@@ -194,6 +194,12 @@ timeout, no network to the server), it asks again up to 3 times with a pause, re
 between; still no answer - the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward
 one).
 
+A stdio server with `mcp-remote` that the running sessions could not start ("Connection closed", a connect timeout) gets
+its cause named instead of "needs a login": the machine has a proxy but the args have no `--enable-proxy` (mcp-remote then
+ignores the proxy and times out) - one exact line to the Hub Developer with the fix, no alarm to the owner, no pointless
+reconnect; no stored login in `~/.mcp-auth` - the usual "never logged in / erased" row; the login and the flag are in
+place - the server is reconnected by itself (this is how a login that appeared later is taken in without the owner).
+
 Buttons of a row:
 
 - **Another login** - on every connected server that has an account: posts `switch <server>`; the plugin

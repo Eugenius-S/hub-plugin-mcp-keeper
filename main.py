@@ -122,6 +122,13 @@ STR = {
         "status_first": "MCP: {ok} connected, {bad} lost, {first} never logged in",
         "why_no_word": "no word from the running sessions yet",
         "why_no_word_program": "a program, not started here: no word from the running sessions yet",
+        "why_no_proxy": "mcp-remote cannot reach the server: this machine has a proxy, but the args have no --enable-proxy "
+                        "(the connection times out and closes)",
+        "fix_proxy": "add \"--enable-proxy\" after the address in the args of {name} (hub.json mcp.{name}.server.args), "
+                     "then: hub mcp reconnect {name}",
+        "why_closed": "the connection closes at start, the login and the proxy flag are in place",
+        "proxy": "MCP does not connect, the cause is known: {lines}",
+        "proxy_line": "\u2022 {name}: {why}. {fix}",
         "switch_unknown": "no other account can be connected to this server from here",
         "switch_noclaude": "Claude Code was not found",
         "switch_failed": "the terminal did not open",
@@ -191,6 +198,13 @@ STR = {
         "status_first": "MCP: подключены {ok}, слетели {bad}, не входили {first}",
         "why_no_word": "работающие сессии пока о нём не говорят",
         "why_no_word_program": "программа, здесь не запускается: работающие сессии пока о ней не говорят",
+        "why_no_proxy": "mcp-remote не доходит до сервера: на машине есть прокси, а в args нет --enable-proxy "
+                        "(соединение зависает и закрывается)",
+        "fix_proxy": "добавь \"--enable-proxy\" после адреса в args {name} (hub.json mcp.{name}.server.args), "
+                     "потом: hub mcp reconnect {name}",
+        "why_closed": "соединение закрывается при запуске, вход и флаг прокси на месте",
+        "proxy": "MCP не подключается, причина известна: {lines}",
+        "proxy_line": "\u2022 {name}: {why}. {fix}",
         "switch_unknown": "к этому серверу отсюда другой аккаунт не подключить",
         "switch_noclaude": "Claude Code не найден",
         "switch_failed": "терминал не открылся",
@@ -885,6 +899,47 @@ def helper_headers(srv):
     return (head or None), (None if head else tr("why_helper_out"))
 
 
+def proxy_env():
+    """Does this machine reach the network through a proxy: a proxy variable of the process, or of the env of Claude
+    Code's settings.json (what the sessions' programs inherit). Names only - the address is never read out."""
+    names = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+    if any(os.environ.get(k) for k in names):
+        return True
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    env = (read_json(os.path.join(base, "settings.json")) or {}).get("env")
+    return isinstance(env, dict) and any(env.get(k) for k in names)
+
+
+def session_failed(name, hub_st):
+    """A live session's Claude Code could not start this server ("Connection closed") and no live session has it up."""
+    failed = False
+    for s in (hub_st.get("sessions") or {}).values():
+        if s.get("state") not in LIVE:
+            continue
+        info = s.get("info") or {}
+        if name in (info.get("mcp_failed") or []):
+            failed = True
+        elif name in (info.get("mcp") or []):
+            return False
+    return failed
+
+
+def failed_remote_row(name, srv, url, hub, had):
+    """A stdio mcp-remote server that did not start, with the cause named (0.13.0): no --enable-proxy on a machine with a
+    proxy (mcp-remote then ignores it: ConnectTimeout, "Connection closed"), else no stored login; else the login and
+    the flag are in place and a reconnect may bring it back (the passes' retries do it)."""
+    args = [a for a in (srv.get("args") or []) if isinstance(a, str)]
+    if proxy_env() and "--enable-proxy" not in args:
+        return {"state": "lost", "why": tr("why_no_proxy"), "fix": tr("fix_proxy", name=name), "unclear": True,
+                "diag": "proxy"}
+    tok = remote_tokens(url)
+    if not tok or not (tok["access"] or tok["refresh"]):
+        fix = login_fix(name, hub)
+        return ({"state": "lost", "why": tr("why_wiped"), "fix": fix} if name in had
+                else {"state": "first", "why": tr("why_first"), "fix": fix})
+    return {"state": "later", "why": tr("why_closed")}
+
+
 def session_verdict(name, hub_st, live=True):
     """What Claude Code in the hub's own sessions says about this server (their MCP status at start and at a turn):
     auth | connected | None. live - only sessions with a process (a sleeping one keeps the word of its last start)."""
@@ -1110,15 +1165,15 @@ def checkup(conf, now, st, hub, hub_st, only=None):
                    else {"state": "ok"} if ok else {"state": "later"})
         out[name] = {**row, "by": "headers"} if cover else row
     if cover:
-        programs(conf, now, out, logged, had, hub, catalog, only)
+        programs(conf, now, out, logged, had, hub, catalog, only, hub_st)
     else:   # 0.3.0 rows: no holder
         for r in out.values():
             r.pop("by", None)
-        rest(conf, out, hub, hub_st, only)
+        rest(conf, out, hub, hub_st, only, had)
     return {"servers": out, "logged": logged, "later_all": False}
 
 
-def rest(conf, out, hub, hub_st, only=None):
+def rest(conf, out, hub, hub_st, only=None, had=()):
     """Every server the hub gives to its sessions gets a row (0.7.0): those the passes above do not look at - a program
     (stdio), a server without a login of its own, one the owner told us to ignore - by the word of the live sessions'
     Claude Code (connected / needs a login / nothing yet). Nothing is started, nothing is asked of a server here."""
@@ -1135,6 +1190,10 @@ def rest(conf, out, hub, hub_st, only=None):
             continue
         word = session_verdict(name, hub_st)
         program = isinstance(srv, dict) and bool(srv.get("command")) and not remote(srv)
+        url = remote_url(srv) if program else None
+        if url and word is None and session_failed(name, hub_st):   # mcp-remote that did not start: say why
+            out[name] = failed_remote_row(name, srv, url, hub, had)
+            continue
         if word == "connected":
             out[name] = {"state": "ok"}
         elif word == "auth":   # no alarm rests on a word of a session alone: the row says "lost", marked unclear
@@ -1157,7 +1216,7 @@ def read_only_row(ent, now, lose):
     return lose(tr("why_expired"))
 
 
-def programs(conf, now, out, logged, had, hub, catalog, only=None):
+def programs(conf, now, out, logged, had, hub, catalog, only=None, hub_st=None):
     """cover: stdio servers - never started. mcp-remote: its stored login is read (never refreshed: mcp-remote does it
     at its start, auth-keeper ahead); the Microsoft 365 program is auth-keeper's; any other program is skipped."""
     for name, srv in sorted(cover_servers().items()):
@@ -1166,6 +1225,9 @@ def programs(conf, now, out, logged, had, hub, catalog, only=None):
         url = remote_url(srv)
         holder = "auth-keeper" if conf["auth_keeper"] else "mcp-remote"
         fix = login_fix(name, hub, catalog)
+        if url and hub_st and session_verdict(name, hub_st) is None and session_failed(name, hub_st):
+            out[name] = {**failed_remote_row(name, srv, url, hub, had), "by": holder}
+            continue
         if url:
             tok = remote_tokens(url)
             if not tok or not (tok["access"] or tok["refresh"]):
@@ -2100,7 +2162,8 @@ def one_pass(now=None):
     st["auto"] = load_state().get("auto", st.get("auto", True))   # the owner may have switched it during the pass
     core = core_busy(hub_st)   # what the core's strip and sign-in handle: no reconnect, no alarm, no login of ours
     if st["auto"]:
-        res["reconnected"] = auto_step(st, sorted(n for n in lost(res) if n not in core), now, conf)
+        res["reconnected"] = auto_step(st, sorted(n for n in lost(res) if n not in core and not servers[n].get("diag")),
+                                       now, conf)
     put(f"ext.{NAME}.checked", {"ok": sorted(n for n, s in servers.items() if s["state"] == "ok"),
                                 "lost": [{"name": n, "why": s.get("why")} for n, s in sorted(bad.items())],
                                 "unclear": sorted(n for n, s in servers.items() if s.get("unclear")),
@@ -2142,6 +2205,12 @@ def one_pass(now=None):
         res["developer"] = developer(hub_st)
         put("message.received", {"to": res["developer"],
                                  "text": message({}, [d for d in res["dups"] if d["name"] in dups], conf, use, ok_at)})
+    cause = said(st, "said_cause", sorted(n for n, s in servers.items() if s.get("diag") and n not in core), now)
+    if cause:   # a cause the Hub Developer can remove itself: one exact line per server, not "a login is needed"
+        res["developer"] = developer(hub_st)
+        put("message.received", {"to": res["developer"], "text": "\n".join(
+            [tr("proxy", lines="")] + [tr("proxy_line", name=n, why=servers[n]["why"], fix=servers[n]["fix"])
+                                      for n in cause])})
     first = sorted(n for n, s in servers.items() if s["state"] == "first" and n not in core)   # the core's strip has its own
     first = said(st, "said_never", first, now)
     if first:   # the Hub Developer asks the owner for one login

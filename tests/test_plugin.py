@@ -1,5 +1,5 @@
 """mcp-keeper: no real claude, network or keychain - a fake `claude` script, a credentials file and patched probes."""
-import contextlib, io, http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
+import contextlib, hashlib, io, http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2312,6 +2312,80 @@ class CoreWaits(Base):
         self.click(1, "reconnect figma")
         main.login_step(NOW + 1)
         self.assertEqual(len(self.reconnects("figma")), 1)
+
+
+class ProxyFlag(Base):
+    """0.13.0: an mcp-remote server that does not start - the cause is named (no --enable-proxy on a machine with a
+    proxy, no stored login), the Hub Developer gets it exactly, and a login that appeared is reconnected by itself."""
+
+    URL = "https://mcp.remote.example/mcp"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["MCP_REMOTE_CONFIG_DIR"] = os.path.join(TMP, "mcp-auth")
+        self.addCleanup(os.environ.pop, "MCP_REMOTE_CONFIG_DIR", None)
+        self.proxy = True
+        p = mock.patch.object(main, "proxy_env", lambda: self.proxy)
+        p.start()
+        self.addCleanup(p.stop)
+        self.args = ["-y", "mcp-remote", self.URL]
+        self.hub["sessions"]["worker"]["info"].update(mcp=["canva", "figma", "remote"], mcp_failed=["remote"])
+        self.set_args()
+
+    def set_args(self):
+        self.config({"mcp": {"remote": {"server": {"command": "npx", "args": self.args}}}})
+
+    def tokens(self):
+        write(os.path.join(TMP, "mcp-auth", "mcp-remote-v1", hashlib.md5(self.URL.encode()).hexdigest() + "_tokens.json"),
+              {"access_token": "a", "refresh_token": "r", "expires_in": 3600})
+
+    def reconnects(self):
+        return [d for t, d in self.facts if t == "mcp.reconnect"]
+
+    def test_a_proxy_machine_without_the_flag_is_named_to_the_developer(self):
+        self.tokens()
+        row = self.run_once()["servers"]["remote"]
+        self.assertEqual(row["state"], "lost")
+        self.assertIn("--enable-proxy", row["why"])
+        self.assertTrue(row["unclear"], "no alarm to the owner: the Hub Developer can fix it")
+        said = self.dev()
+        self.assertEqual(len(said), 1)
+        self.assertIn("--enable-proxy", said[0]["text"])
+        self.assertIn("hub mcp reconnect remote", said[0]["text"])
+        self.assertEqual((self.notes(), self.reconnects()), ([], []), "a reconnect cannot cure it")
+        self.run_once(NOW + 3600)
+        self.assertEqual(len(self.dev()), 0, "once per server, not at every pass")
+
+    def test_the_flag_in_place_and_no_login_is_a_first_login(self):
+        self.args.append("--enable-proxy")
+        self.set_args()
+        row = self.run_once()["servers"]["remote"]
+        self.assertEqual(row["state"], "first")
+        self.assertIn("hub mcp login", row["fix"])
+        self.assertNotIn("--enable-proxy", row["why"])
+
+    def test_a_login_that_appeared_is_reconnected_without_the_owner(self):
+        self.args.append("--enable-proxy")
+        self.set_args()
+        self.tokens()
+        res = self.run_once()
+        self.assertEqual(self.reconnects(), [{"server": "remote"}])
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+        self.assertIn("proxy flag are in place", res["servers"]["remote"]["why"])
+        self.assertTrue(res["servers"]["remote"]["unclear"])
+
+    def test_no_proxy_on_the_machine_is_not_blamed_on_the_flag(self):
+        self.proxy = False
+        self.tokens()
+        row = self.run_once()["servers"]["remote"]
+        self.assertNotIn("--enable-proxy", row.get("why", ""))
+        self.assertEqual(self.dev(), [])
+
+    def test_a_server_that_is_up_in_a_session_is_not_diagnosed(self):
+        self.hub["sessions"]["worker"]["info"]["mcp_failed"] = []
+        self.tokens()
+        self.assertEqual(self.run_once()["servers"]["remote"], {"state": "ok"})
+        self.assertEqual(self.dev(), [])
 
 
 class Manifest(unittest.TestCase):
