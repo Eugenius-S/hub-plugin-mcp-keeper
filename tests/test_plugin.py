@@ -43,12 +43,14 @@ class Base(unittest.TestCase):
         self.asked = []    # names `claude mcp get` was asked about
         self.gets = {}     # name -> output of `claude mcp get <name>` (a list is consumed, the last repeats)
         self.probes = {}   # server url -> (ok, code)
+        self.opens = {}    # server url -> an anonymous initialize answer (True open / False 401 / None unclear)
         self.keyed = []    # (url, header names) a headers server was asked with
         patches = [
             mock.patch.object(main, "put", lambda t, d, entity=None: self.facts.append((t, d))),
             mock.patch.object(main, "mcp_get", self.fake_get),
             mock.patch.object(main, "probe", lambda ent: self.answer(ent.get("serverUrl"))),
             mock.patch.object(main, "probe_keyed", self.fake_keyed),
+            mock.patch.object(main, "probe_open", self.fake_open),
             mock.patch.object(main, "net_up", lambda: True),
             mock.patch.object(main, "processes", lambda name: [{"pid": 1, "started": "x", "kind": "claude"}]),
             mock.patch.object(main, "lang", lambda: "en"),
@@ -78,6 +80,10 @@ class Base(unittest.TestCase):
         if plugin is not None:
             cfg["extensions"] = {"mcp-keeper": plugin}
         write(os.environ["HUB_CONFIG"], cfg)
+
+    def fake_open(self, url):
+        """An initialize without a login: a server that needs one by default (401); self.opens lists the open ones."""
+        return self.opens.get(url, False)
 
     def fake_keyed(self, url, head):
         self.keyed.append((url, sorted(head)))
@@ -863,6 +869,15 @@ class FirstLogin(Base):
         write(os.environ["MCP_KEEPER_CREDS"], recs)
         self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
         self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
+
+    def test_an_open_server_is_not_never_logged_in_even_if_sessions_say_auth(self):
+        """Claude Code marks an open server as needing a login when its OAuth discovery fails (a registration 404);
+        the server itself answers an initialize without a login: nothing to log in to, nobody is told."""
+        self.opens[URLS["mobbin"]] = True   # an anonymous initialize = 200
+        res = self.run_once()
+        self.assertEqual(res["servers"]["mobbin"], {"state": "ok"})
+        self.assertEqual((self.notes(), self.dev()), ([], []))
+        self.assertEqual(read(os.environ["MCP_KEEPER_STATUS"])["servers"]["mobbin"]["state"], "ok")
 
     def test_first_is_shown_and_told_to_the_developer_once_per_name(self):
         res = self.run_once()
@@ -2302,7 +2317,7 @@ class CoreWaits(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.11.0")
+        self.assertEqual(m["version"], "0.12.1")
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)

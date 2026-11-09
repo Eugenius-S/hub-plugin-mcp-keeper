@@ -1052,8 +1052,12 @@ def checkup(conf, now, st, hub, hub_st, only=None):
         if not has:
             if name in had:   # it was live with a stored login and the record is gone: something erased it
                 out[name] = {"state": "lost", "why": tr("why_wiped"), "fix": fix, "by": by}
-            elif session_verdict(name, hub_st, live=False) == "auth":   # never logged in, and sessions wait for it
-                out[name] = {"state": "first", "why": tr("why_first"), "fix": fix, "by": by}
+            elif session_verdict(name, hub_st, live=False) == "auth":   # sessions wait for a login
+                # an open server (an initialize without a login is answered) has no login to make: the word of the
+                # sessions comes from a failed OAuth discovery (e.g. a registration 404), not from a 401
+                ok = probe_open(url) if url else None
+                out[name] = ({"state": "ok", "by": "none"} if ok
+                             else {"state": "first", "why": tr("why_first"), "fix": fix, "by": by})
             elif cover and url:   # every server of the machine: one that needs no login, or one never logged in
                 ok = probe_open(url)
                 out[name] = ({"state": "ok", "by": "none"} if ok   # answers an initialize without a login: connected, nothing to press
