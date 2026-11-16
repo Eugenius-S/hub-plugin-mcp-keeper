@@ -1,5 +1,5 @@
 """mcp-keeper: no real claude, network or keychain - a fake `claude` script, a credentials file and patched probes."""
-import contextlib, hashlib, io, http.server, json, os, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
+import contextlib, hashlib, io, http.server, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -530,8 +530,8 @@ class Secrets(Base):
                                              "b": {"state": "weird"}, "c": "text"}})
         self.assertEqual(got["servers"], {"a": {"state": "ok", "ok_at": 2, "title": "A"}})
         got = main.clean_status({"servers": {"a": {"state": "lost", "can_login": True}, "b": {"state": "lost", "can_login": "yes"}}})
-        self.assertEqual(got["servers"], {"a": {"state": "lost", "title": "A", "can_login": True},
-                                          "b": {"state": "lost", "title": "B"}})
+        self.assertEqual(got["servers"], {"a": {"state": "lost", "title": "A"}, "b": {"state": "lost", "title": "B"}},
+                         "0.14.0: the login is in the core's strip, a row of an older status loses the flag")
         got = main.clean_status({"servers": {"a": {"state": "ok", "can_switch": True, "title": "Mobbin"},
                                              "b": {"state": "skip", "ignored": True, "title": "x" * 99},
                                              "c": {"state": "ok", "can_switch": "yes", "ignored": 1}}})
@@ -766,7 +766,7 @@ class Net(Base):
         with mock.patch.object(main.time, "sleep", sleep), mock.patch.object(main.time, "time", lambda: wall[0]), \
                 mock.patch.object(main, "net_up", lambda: net.append(1) or True), mock.patch.object(main, "once", once), \
                 mock.patch.object(main, "start_clean", lambda: None), mock.patch.object(main, "write_status", lambda s: None), \
-                mock.patch.object(main, "load_state", lambda: {"at": wall[0]}), mock.patch.object(main, "report", lambda r: None),                 mock.patch.object(main, "login_watch", lambda: None), mock.patch.object(main, "start_auto", lambda: None):
+                mock.patch.object(main, "load_state", lambda: {"at": wall[0]}), mock.patch.object(main, "report", lambda r: None),                 mock.patch.object(main, "login_watch", lambda: None):
             # a real login_watch thread outlives the test and writes login.json under the next ones (Windows: flaky)
             with self.assertRaises(Stop):
                 main.loop()
@@ -1172,7 +1172,7 @@ class Cover(Base):
         self.assertEqual(s["state"], "lost")
         self.assertIn("gate (claude)", out.getvalue())
         self.assertNotIn("gate", " ".join(d["text"] for d in self.dev()))
-        self.assertEqual(self.reconnects("gate"), ["gate"])
+        self.assertEqual(self.reconnects("gate"), [], "0.14.0: the core reconnects a failed server itself")
 
     def test_the_second_look_waits_a_minute(self):
         self.gate()
@@ -1289,153 +1289,9 @@ class Cover(Base):
         self.assertEqual(main.duplicates(), [])
 
 
-class ViewLogin(Base):
-    """The view's "Log in" button: the owner's post "login <server>" in the plugin channel -> `hub mcp login` run by the
-    process (a fake here, nothing is opened); the row says what the login is doing."""
-
-    def setUp(self):
-        super().setUp()
-        recs = read(os.environ["MCP_KEEPER_CREDS"])
-        del recs["mcpOAuth"]["mobbin|abc"]
-        write(os.environ["MCP_KEEPER_CREDS"], recs)
-        self.hub["sessions"]["worker"]["info"]["mcp"].append("mobbin")
-        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = ["mobbin"]
-        self.reject("canva")
-        res = self.run_once()
-        self.assertEqual((res["servers"]["mobbin"]["state"], res["servers"]["canva"]["state"]), ("first", "lost"))
-        self.ran = []
-        self.code, self.out = 0, "login waits for the browser\n"
-        self.result = None   # what the hub's waiting process wrote: (code, last line) or None - still waiting
-        self.hub["feeds"] = {main.NAME: []}
-        for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
-                  mock.patch.object(main, "login_result", lambda server: self.result),
-                  mock.patch.object(main, "run_limited", self.fake_run)):
-            p.start()
-            self.addCleanup(p.stop)
-        main.RECHECK_NOW.clear()
-
-    def fake_run(self, cmd, timeout, merge=True):
-        self.ran.append(cmd[2:])
-        return self.code, self.out
-
-    def click(self, seq, server, by="owner", ts=NOW, text=None):
-        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": by, "text": text or f"login {server}", "ts": ts})
-
-    def rows(self):
-        return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
-
-    def test_only_a_server_that_needs_login_has_the_button(self):
-        rows = self.rows()
-        self.assertTrue(rows["mobbin"]["can_login"] and rows["canva"]["can_login"])
-        self.assertNotIn("can_login", rows["figma"])
-
-    def test_click_runs_the_hub_command_with_a_live_session_that_has_the_server(self):
-        self.click(1, "mobbin")
-        self.assertTrue(main.login_step(NOW + 1))
-        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
-        self.assertEqual(self.rows()["mobbin"]["login"], {"state": "wait", "at": NOW + 1})
-
-    def test_no_live_session_with_the_server_takes_a_sleeping_one_then_the_hub(self):
-        self.hub["sessions"]["worker"]["info"]["mcp"].remove("mobbin")
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.ran, [["mcp", "login", "sleepy", "mobbin"]], "a sleeping session is still a session of the server")
-        self.hub["sessions"]["sleepy"]["info"]["mcp_auth"] = []
-        self.result = (1, "gone")
-        main.login_step(NOW + 2)
-        self.click(2, "mobbin")
-        main.login_step(NOW + 3)
-        self.assertEqual(self.ran[-1], ["mcp", "login", "hub", "mobbin"])
-
-    def test_the_post_is_taken_once_and_only_from_the_owner_while_fresh(self):
-        self.click(1, "mobbin", by="worker")
-        self.click(2, "mobbin", ts=NOW - main.LOGIN_FRESH - 5)
-        self.click(3, "mobbin", text="login mobbin --evil; x")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.ran, [])
-        self.click(4, "mobbin")
-        main.login_step(NOW + 2)
-        self.result = (1, "no")
-        main.login_step(NOW + 3)
-        main.login_step(NOW + 4)
-        self.assertEqual(len(self.ran), 1, "the same post does not start a second login")
-
-    def test_open_login_is_not_started_twice(self):
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.click(2, "mobbin")
-        main.login_step(NOW + 2)
-        self.assertEqual(len(self.ran), 1)
-
-    def test_server_without_the_button_is_refused_not_run(self):
-        self.click(1, "figma")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.ran, [])
-        row = self.rows()["figma"]["login"]
-        self.assertEqual(row["state"], "fail")
-        self.assertIn("no login", row["why"])
-
-    def test_command_failure_is_shown_with_the_reason(self):
-        self.code, self.out = 1, "no such session\nhttps://secret.example/auth?code=1\nsession x does not exist\n"
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        got = self.rows()["mobbin"]["login"]
-        self.assertEqual(got["state"], "fail")
-        self.assertEqual(got["why"], "session x does not exist")
-        self.assertNotIn("secret", json.dumps(self.rows()))
-
-    def test_no_hub_command_is_a_fail_not_a_crash(self):
-        with mock.patch.object(main, "hub_bin", lambda: None):
-            self.click(1, "mobbin")
-            main.login_step(NOW + 1)
-        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "fail")
-        self.assertEqual(self.ran, [])
-
-    def test_waiting_ends_with_the_result_of_the_hub_process(self):
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.assertFalse(main.login_step(NOW + 10), "still waiting: nothing changes")
-        self.assertFalse(main.RECHECK_NOW.is_set())
-        self.result = (0, "logged in")
-        self.assertTrue(main.login_step(NOW + 20))
-        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "done")
-        self.assertTrue(main.RECHECK_NOW.is_set(), "the next pass checks at once, not in 15 minutes")
-
-    def test_waiting_ends_with_a_failure_and_with_a_timeout(self):
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.result = (1, "the browser was closed")
-        main.login_step(NOW + 20)
-        self.assertEqual(self.rows()["mobbin"]["login"], {"state": "fail", "at": NOW + 20, "why": "the browser was closed"})
-        self.result = None
-        self.click(2, "canva")
-        main.login_step(NOW + 30)
-        main.login_step(NOW + 30 + main.LOGIN_LIVE + 1)
-        got = self.rows()["canva"]["login"]
-        self.assertEqual(got["state"], "fail")
-        self.assertIn("no login within", got["why"])
-
-    def test_login_done_at_once_is_done(self):
-        self.result = (0, "")
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.rows()["mobbin"]["login"]["state"], "done")
-        self.assertTrue(main.RECHECK_NOW.is_set())
-
-    def test_an_old_result_goes_from_the_view(self):
-        self.click(1, "mobbin")
-        main.login_step(NOW + 1)
-        self.result = (0, "")
-        main.login_step(NOW + 2)
-        self.assertIn("login", self.rows()["mobbin"])
-        with mock.patch.object(main.time, "time", lambda: NOW + 2 + main.LOGIN_SHOW + 1):
-            main.write_status(main.load_state())
-        self.assertNotIn("login", self.rows()["mobbin"])
-
-
 class ViewAdd(Base):
-    """0.8.0 "Add MCP": the owner's post "add <name> <address>" -> `claude mcp add`, `hub tools import mcp`, the login. Every
-    command is a fake here: nothing is added to ~/.claude.json or to a hub."""
+    """0.8.0 "Add MCP": the owner's post "add <name> <address>" -> `claude mcp add`, `hub tools import mcp`; since 0.14.0
+    the sign-in is the core's (its strip). Every command is a fake here: nothing is added to ~/.claude.json or to a hub."""
 
     GOOD = "https://mcp.example.com/mcp"
 
@@ -1444,10 +1300,8 @@ class ViewAdd(Base):
         self.run_once()
         self.ran, self.answers = [], {}
         self.hub["feeds"] = {main.NAME: []}
-        self.login_done = None
         for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
                   mock.patch.object(main, "claude_cmd", lambda: ["/bin/claude"]),
-                  mock.patch.object(main, "login_result", lambda server: self.login_done),
                   mock.patch.object(main, "probe_open", lambda url: None),   # the network is closed
                   mock.patch.object(main, "run_limited", self.fake_run)):
             p.start()
@@ -1481,32 +1335,16 @@ class ViewAdd(Base):
     def status(self):
         return read(os.environ["MCP_KEEPER_STATUS"])
 
-    def test_click_adds_the_standard_way_then_opens_the_login(self):
+    def test_click_adds_the_standard_way_and_leaves_the_login_to_the_core(self):
         self.post(1, "add newsvc " + self.GOOD)
         self.assertTrue(main.login_step(NOW + 1))
         self.assertEqual(self.ran[0], ["/bin/claude", "mcp", "add", "--transport", "http", "-s", "user", "newsvc", self.GOOD])
         self.assertEqual(self.ran[1][2:], ["tools", "import", "mcp", "newsvc", "--about", "Newsvc"])
-        self.assertEqual(self.ran[2][2:], ["mcp", "login", "hub", "newsvc"])
-        self.assertEqual(self.kinds(), ["add", "import", "login"])
+        self.assertEqual(self.kinds(), ["add", "import"], "no `hub mcp login`: the core's strip has the sign-in")
         add = self.status()["add"]
-        self.assertEqual((add["state"], add["name"], add["login"]), ("done", "newsvc", {"state": "wait"}))
+        self.assertEqual((add["state"], add["name"]), ("done", "newsvc"))
+        self.assertNotIn("login", add)
         self.assertTrue(main.RECHECK_NOW.is_set(), "the new server joins the table at the next pass")
-
-    def test_the_login_that_ended_is_shown_under_the_add(self):
-        self.post(1, "add newsvc " + self.GOOD)
-        main.login_step(NOW + 1)
-        self.login_done = (0, "logged in")
-        main.login_step(NOW + 20)
-        self.assertEqual(self.status()["add"]["login"], {"state": "done"})
-
-    def test_a_login_that_fails_leaves_the_server_added(self):
-        self.answers["login"] = (1, "the browser was closed\n")
-        self.post(1, "add newsvc " + self.GOOD)
-        main.login_step(NOW + 1)
-        add = self.status()["add"]
-        self.assertEqual(add["state"], "done")
-        self.assertEqual(add["login"]["state"], "fail")
-        self.assertEqual(add["login"]["why"], "the browser was closed")
 
     def test_a_local_http_address_is_taken(self):
         self.assertEqual(main.add_server("local", "http://localhost:8080/mcp", self.hub, NOW)["state"], "done")
@@ -1574,15 +1412,6 @@ class ViewAdd(Base):
         self.answers["import"] = (1, "no such server\n")
         main.add_server("svc", self.GOOD, self.hub, NOW)
         self.assertEqual(self.kinds().count("import"), 1)
-
-    def test_a_server_that_needs_no_login_is_not_sent_to_the_login(self):
-        with mock.patch.object(main, "probe_open", lambda url: True):
-            self.post(1, "add newsvc " + self.GOOD)
-            main.login_step(NOW + 1)
-        self.assertEqual(self.kinds(), ["add", "import"])
-        add = self.status()["add"]
-        self.assertEqual((add["state"], add["name"]), ("done", "newsvc"))
-        self.assertNotIn("login", add)
 
     def test_no_claude_and_no_hub_are_fails_not_crashes(self):
         with mock.patch.object(main, "claude_cmd", lambda: None):
@@ -1760,8 +1589,8 @@ class Icon(unittest.TestCase):
 
 
 class Unclear(Base):
-    """0.6.0, owner 28.10: the view says only live or lost. What the pass cannot judge is asked again with a pause,
-    reconnected in the sessions in between; still no answer - lost with the reason, no alarm."""
+    """0.6.0, owner 28.10: the view says only live or lost. What the pass cannot judge is asked again with a pause (the
+    core reconnects a failed server in the sessions itself, 0.14.0); still no answer - lost with the reason, no alarm."""
 
     def reconnects(self):
         return [d["server"] for t, d in self.facts if t == "mcp.reconnect"]
@@ -1773,14 +1602,13 @@ class Unclear(Base):
         self.assertNotIn("later", json.dumps(got))
         self.assertEqual(got["servers"]["figma"]["state"], "lost")
         self.assertIn("no clear answer after 4", got["servers"]["figma"]["why"])
-        self.assertTrue(got["auto"])
 
     def test_retries_then_lost_without_an_alarm(self):
         self.probes[URLS["figma"]] = (None, None)
         res = self.run_once()
         self.assertUnclear(res["servers"]["figma"])
         self.assertEqual((self.notes(), self.dev()), ([], []))
-        self.assertEqual(self.reconnects(), ["figma"], "auto: once per pass, before the retries")
+        self.assertEqual(self.reconnects(), [], "0.14.0: no reconnect of ours between the retries")
 
     def test_an_answer_on_a_retry_is_taken(self):
         calls = []
@@ -1803,41 +1631,6 @@ class Unclear(Base):
     def test_one_time_login_is_never_reconnected(self):
         self.probes[URLS["canva"]] = (None, None)
         self.run_once()
-        self.assertEqual(self.reconnects(), [])
-
-    def test_auto_off_does_not_reconnect(self):
-        st = main.load_state()
-        st["auto"] = False
-        main.save_state(st)
-        self.probes[URLS["figma"]] = (None, None)
-        res = self.run_once()
-        self.assertUnclear(res["servers"]["figma"])
-        self.assertEqual(self.reconnects(), [])
-        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
-
-    def test_auto_reconnect_not_more_often_than_ten_minutes(self):
-        self.probes[URLS["figma"]] = (None, None)
-        self.run_once(NOW)
-        self.run_once(NOW + 300)
-        self.assertEqual(self.reconnects(), [])
-        self.run_once(NOW + main.AUTO_EVERY + 1)
-        self.assertEqual(self.reconnects(), ["figma"])
-
-    def test_a_lost_server_reconnects_at_start(self):
-        self.reject("figma", "canva")
-        self.run_once()
-        self.assertEqual(self.reconnects(), ["figma"], "a pass reconnects what is lost")
-        st = main.load_state()
-        st["reconnected"] = {}
-        main.save_state(st)
-        self.facts.clear()
-        main.start_auto()
-        self.assertEqual(self.reconnects(), ["figma"], "canva: a one-time login is not touched")
-        self.facts.clear()
-        st = main.load_state()
-        st["auto"], st["reconnected"] = False, {}
-        main.save_state(st)
-        main.start_auto()
         self.assertEqual(self.reconnects(), [])
 
 
@@ -1874,8 +1667,9 @@ class Curl(Base):
 
 
 class ViewReconnect(Base):
-    """The view's "Reconnect" button and the "Reconnect automatically" box: the owner's posts "reconnect <server>" and
-    "auto on|off" in the plugin channel."""
+    """The view's "Reconnect" button: the owner's post "reconnect <server>" in the plugin channel asks the core
+    (mcp.reconnect_requested, 0.14.0), then the server is checked again. The "Reconnect automatically" box is gone: the
+    core does it."""
 
     def setUp(self):
         super().setUp()
@@ -1894,7 +1688,7 @@ class ViewReconnect(Base):
         self.accept("figma")
         self.post(1, "reconnect figma")
         self.assertTrue(main.login_step(NOW + 1))
-        self.assertIn(("mcp.reconnect", {"server": "figma"}), self.facts)
+        self.assertIn(("mcp.reconnect_requested", {"server": "figma"}), self.facts)
         row = self.rows()["figma"]
         self.assertEqual(row["state"], "ok")
         self.assertEqual((row["login"]["state"], row["login"]["act"]), ("done", "reconnect"))
@@ -1907,25 +1701,12 @@ class ViewReconnect(Base):
 
     def test_only_the_owner_and_only_a_known_server(self):
         self.post(1, "reconnect figma", by="worker")
-        self.post(2, "auto off", by="worker")
         main.login_step(NOW + 1)
         self.assertEqual(self.facts, [])
-        self.assertTrue(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
         self.post(3, "reconnect nosuch")
         main.login_step(NOW + 2)
         self.assertEqual(self.facts, [])
         self.assertNotIn("nosuch", self.rows())
-
-    def test_auto_box_is_kept(self):
-        self.post(1, "auto off")
-        main.login_step(NOW + 1)
-        self.assertFalse(main.load_state()["auto"])
-        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"])
-        self.run_once(NOW + 100)
-        self.assertFalse(read(os.environ["MCP_KEEPER_STATUS"])["auto"], "a pass keeps the owner's choice")
-        self.post(2, "auto on")
-        main.login_step(NOW + 101)
-        self.assertTrue(main.load_state()["auto"])
 
 
 class ViewSwitch(Base):
@@ -2183,8 +1964,8 @@ class OldWatch:
 
 class CoreWaits(Base):
     """0.10.0, owner 30.10 ("the third of the function is closed by the core, take it out of our plugin"): a server the
-    core waits on itself (mcp_waits, a sign-in of the core under way) gets no alarm, no automatic reconnect, no "Log in"
-    of ours. An older core (no mcpwatch.view): the plugin works as 0.9.1."""
+    core waits on itself (mcp_waits, a sign-in of the core under way) gets no alarm of ours. An older core (no
+    mcpwatch.view): the alarm works as 0.9.1. Since 0.14.0 the plugin has no reconnect and no login of its own at all."""
 
     def core(self, waits=(), logins=None, new=True):
         from core import mcpwatch  # noqa: F401 - the module exists on every core
@@ -2206,7 +1987,6 @@ class CoreWaits(Base):
         self.hub["feeds"] = {main.NAME: []}
         self.ran = []
         for p in (mock.patch.object(main, "hub_bin", lambda: "/hub/bin/hub"),
-                  mock.patch.object(main, "login_result", lambda server: None),
                   mock.patch.object(main, "run_limited", lambda cmd, timeout, merge=True: (self.ran.append(cmd[2:]) or (0, "waits")))):
             p.start()
             self.addCleanup(p.stop)
@@ -2215,7 +1995,7 @@ class CoreWaits(Base):
         return read(os.environ["MCP_KEEPER_STATUS"])["servers"]
 
     def reconnects(self, name):
-        return [d for t, d in self.facts if t == "mcp.reconnect" and d["server"] == name]
+        return [d for t, d in self.facts if t.startswith("mcp.reconnect") and d["server"] == name]
 
     def click(self, seq, text):
         self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": "owner", "text": text, "ts": NOW})
@@ -2226,18 +2006,13 @@ class CoreWaits(Base):
         self.assertIsNone(main.core_view(self.hub))
         self.assertEqual(main.core_busy(self.hub), set())
 
-    def test_an_older_core_alarms_and_reconnects_and_offers_login_as_before(self):
+    def test_an_older_core_alarms_as_before(self):
         self.core(waits=["figma", "canva"], new=False)   # whatever the state says: this core has no strip
         self.reject("figma", "canva")
         self.run_once()
         self.assertEqual(len(self.notes()), 1)
-        self.assertEqual(len(self.reconnects("figma")), 1)
-        rows = self.rows()
-        self.assertTrue(rows["canva"]["can_login"])
-        self.assertNotIn("core_wait", rows["canva"])
-        self.click(1, "login mobbin")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
+        self.assertEqual(self.reconnects("figma"), [])
+        self.assertNotIn("core_wait", self.rows()["canva"])
 
     # (b) a new core, the server is in mcp_waits
     def test_a_waiting_server_gets_no_alarm_and_no_reconnect(self):
@@ -2255,25 +2030,22 @@ class CoreWaits(Base):
         self.assertEqual(self.reconnects("figma"), [])
         self.assertTrue(main.core_busy(self.hub) == {"figma"}, "a finished sign-in of the core does not hold the server")
 
-    def test_a_waiting_server_has_no_login_button_but_a_note(self):
+    def test_a_waiting_server_has_a_note(self):
         self.core(waits=["canva"])
         self.reject("canva")
         self.run_once()
-        row = self.rows()["canva"]
-        self.assertNotIn("can_login", row)
-        self.assertTrue(row["core_wait"])
-        self.assertTrue(self.rows()["mobbin"]["can_login"], "a server the core does not wait on keeps the button")
+        self.assertTrue(self.rows()["canva"]["core_wait"])
+        self.assertNotIn("core_wait", self.rows()["mobbin"])
 
-    def test_a_click_on_login_of_a_waiting_server_does_not_start_our_login(self):
+    def test_a_click_on_login_of_an_older_view_starts_nothing(self):
         self.core(waits=["canva"])
         self.reject("canva")
         self.run_once()
         self.click(1, "login canva")
+        self.click(2, "login mobbin")
         main.login_step(NOW + 1)
         self.assertEqual(self.ran, [])
-        got = self.rows()["canva"]["login"]
-        self.assertEqual(got["state"], "fail")
-        self.assertIn("hub handles", got["why"])
+        self.assertNotIn("login", self.rows()["canva"])
 
     def test_a_waiting_server_is_not_told_as_a_first_login_either(self):
         self.core(waits=["mobbin"])
@@ -2281,13 +2053,13 @@ class CoreWaits(Base):
         self.assertEqual([d for d in self.dev() if "mobbin" in d["text"]], [])
 
     # (c) a new core, the server is not in mcp_waits: as before
-    def test_a_server_the_core_does_not_wait_on_is_alarmed_and_reconnected(self):
+    def test_a_server_the_core_does_not_wait_on_is_alarmed(self):
         self.core(waits=["canva"])
         self.reject("figma")
         self.run_once()
         self.assertEqual(len(self.notes()), 1)
         self.assertIn("figma", self.notes()[0]["text"])
-        self.assertEqual(len(self.reconnects("figma")), 1)
+        self.assertEqual(self.reconnects("figma"), [], "the core reconnects it itself")
 
     def test_a_waiting_server_does_not_hide_another_lost_one_from_the_alarm(self):
         self.core(waits=["figma"])
@@ -2297,13 +2069,6 @@ class CoreWaits(Base):
         self.assertIn("canva", text)
         self.assertNotIn("figma", text)
 
-    def test_the_login_of_a_server_the_core_does_not_wait_on_runs(self):
-        self.core(waits=["canva"])
-        self.run_once()
-        self.click(1, "login mobbin")
-        main.login_step(NOW + 1)
-        self.assertEqual(self.ran, [["mcp", "login", "worker", "mobbin"]])
-
     def test_the_manual_reconnect_stays_for_a_waiting_server(self):
         self.core(waits=["figma"])
         self.reject("figma")
@@ -2311,12 +2076,12 @@ class CoreWaits(Base):
         self.facts.clear()
         self.click(1, "reconnect figma")
         main.login_step(NOW + 1)
-        self.assertEqual(len(self.reconnects("figma")), 1)
+        self.assertEqual([t for t, d in self.facts if d.get("server") == "figma"], ["mcp.reconnect_requested"])
 
 
 class ProxyFlag(Base):
     """0.13.0: an mcp-remote server that does not start - the cause is named (no --enable-proxy on a machine with a
-    proxy, no stored login), the Hub Developer gets it exactly, and a login that appeared is reconnected by itself."""
+    proxy, no stored login), the Hub Developer gets it exactly; a login that appeared is reconnected by the core."""
 
     URL = "https://mcp.remote.example/mcp"
 
@@ -2340,7 +2105,7 @@ class ProxyFlag(Base):
               {"access_token": "a", "refresh_token": "r", "expires_in": 3600})
 
     def reconnects(self):
-        return [d for t, d in self.facts if t == "mcp.reconnect"]
+        return [d for t, d in self.facts if t.startswith("mcp.reconnect")]
 
     def test_a_proxy_machine_without_the_flag_is_named_to_the_developer(self):
         self.tokens()
@@ -2364,12 +2129,12 @@ class ProxyFlag(Base):
         self.assertIn("hub mcp login", row["fix"])
         self.assertNotIn("--enable-proxy", row["why"])
 
-    def test_a_login_that_appeared_is_reconnected_without_the_owner(self):
+    def test_a_login_that_appeared_is_left_to_the_core_without_the_owner(self):
         self.args.append("--enable-proxy")
         self.set_args()
         self.tokens()
         res = self.run_once()
-        self.assertEqual(self.reconnects(), [{"server": "remote"}])
+        self.assertEqual(self.reconnects(), [], "0.14.0: the core reconnects a failed server itself")
         self.assertEqual((self.notes(), self.dev()), ([], []))
         self.assertIn("proxy flag are in place", res["servers"]["remote"]["why"])
         self.assertTrue(res["servers"]["remote"]["unclear"])
@@ -2388,10 +2153,81 @@ class ProxyFlag(Base):
         self.assertEqual(self.dev(), [])
 
 
+class CoreDoesIt(Base):
+    """0.14.0, owner 16.11 (the plugin audit): since Plugin API 1.31 the core reconnects a failed MCP itself, shows the
+    servers waiting for a sign-in and signs in from its strip, reconnecting the sessions after. The plugin keeps what the
+    core does not do: the early check of stored logins and the exact cause (no --enable-proxy). It sends no reconnect of
+    its own (mcp.reconnect was never a core fact), starts no `hub mcp login`; the view's "Reconnect" asks the core
+    (mcp.reconnect_requested)."""
+
+    def setUp(self):
+        super().setUp()
+        self.hub["feeds"] = {main.NAME: []}
+        self.ran = []
+        p = mock.patch.object(main, "run_limited",
+                              lambda cmd, timeout, merge=True: (self.ran.append(cmd[2:]) or (0, "waits")))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def click(self, seq, text):
+        self.hub["feeds"][main.NAME].append({"id": f"p{seq}", "by": "owner", "text": text, "ts": NOW})
+
+    def reconnects(self):
+        return [(t, d) for t, d in self.facts if t.startswith("mcp.reconnect")]
+
+    def test_a_pass_sends_no_reconnect_the_core_retries_itself(self):
+        self.reject("figma")
+        self.probes[URLS["canva"]] = (None, None)   # unclear: asked again, still no reconnect in between
+        self.run_once()
+        self.assertEqual(self.reconnects(), [])
+        self.assertEqual(len(self.notes()), 1, "the early alarm about a lost login stays")
+        self.assertFalse(hasattr(main, "auto_step") or hasattr(main, "start_auto"))
+
+    def test_the_view_reconnect_asks_the_core(self):
+        self.reject("figma")
+        self.run_once()
+        self.facts.clear()
+        self.click(1, "reconnect figma")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.reconnects(), [("mcp.reconnect_requested", {"server": "figma"})])
+
+    def test_no_login_of_its_own(self):
+        self.reject("figma")
+        self.run_once()
+        self.click(1, "login figma")
+        self.click(2, "auto off")
+        main.login_step(NOW + 1)
+        self.assertEqual(self.ran, [])
+        self.assertFalse(hasattr(main, "login_start"))
+        got = read(os.environ["MCP_KEEPER_STATUS"])
+        self.assertNotIn("auto", got)
+        self.assertFalse([n for n, r in got["servers"].items() if "can_login" in r or "login" in r])
+
+    def test_a_login_row_of_an_older_version_is_not_shown(self):
+        self.reject("figma")
+        self.run_once()
+        main.write_json(main.login_path(), {"seen": 0, "rows": {"figma": {"state": "wait", "at": NOW}}})
+        main.write_status(main.load_state())
+        self.assertNotIn("login", read(os.environ["MCP_KEEPER_STATUS"])["servers"]["figma"])
+
+    def test_every_fact_it_sends_is_one_the_core_knows(self):
+        try:
+            import core
+        except ImportError:
+            self.skipTest("no core on the path")
+        with open(os.path.join(os.path.dirname(core.__file__), "reducer.py"), encoding="utf-8") as f:
+            known = f.read()
+        with open(os.path.join(ROOT, "main.py"), encoding="utf-8") as f:
+            sent = set(re.findall(r'\bput\(\s*"([a-z_.]+)"', f.read()))
+        self.assertTrue(sent)
+        self.assertEqual(sorted(k for k in sent if '"%s"' % k not in known), [])
+
+
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.12.1")
+        self.assertEqual(m["version"], "0.14.0")
+        self.assertEqual(m["hub"], "^1.31")   # the core's mcpwatch: reconnect, strip, sign-in
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))
         self.assertNotIn("жив", text)
@@ -2427,8 +2263,8 @@ console.log(JSON.stringify(out));
 
 
 class ViewButtons(unittest.TestCase):
-    """0.7.1: a connected server has only "Another login"; "Log in" stays for a lost one and a never-logged-in one.
-    The page is run in node with a stub hub (no browser)."""
+    """0.7.1: a connected server has only "Another login"; a lost one and a never-logged-in one have "Reconnect".
+    0.14.0: no "Log in" of ours, the core's strip has it. The page is run in node with a stub hub (no browser)."""
 
     def buttons(self, rows, snap=None):
         import shutil
@@ -2441,14 +2277,14 @@ class ViewButtons(unittest.TestCase):
         self.assertEqual(got.returncode, 0, got.stderr)
         return json.loads(got.stdout)
 
-    def test_an_active_server_has_only_connect_another_and_a_lost_one_keeps_login(self):
+    def test_an_active_server_has_only_connect_another_and_a_lost_one_reconnect(self):
         rows = {"figma": {"state": "ok", "title": "Figma", "can_login": True, "can_switch": True},
                 "buffer": {"state": "lost", "title": "Buffer", "can_login": True},
                 "mobbin": {"state": "first", "title": "Mobbin", "can_login": True}}
         got = self.buttons(rows)
         self.assertEqual(got["Figma"], ["mk-switch"])
-        self.assertEqual(got["Buffer"], ["mk-reconnect", "mk-login"])
-        self.assertEqual(got["Mobbin"], ["mk-reconnect", "mk-login"])
+        self.assertEqual(got["Buffer"], ["mk-reconnect"], "an older status with can_login gives no login button")
+        self.assertEqual(got["Mobbin"], ["mk-reconnect"])
 
     def test_an_active_server_without_a_login_of_its_own_has_no_buttons(self):
         got = self.buttons({"canva": {"state": "ok", "title": "Canva", "can_login": True}})
@@ -2469,29 +2305,29 @@ class ViewButtons(unittest.TestCase):
         got = self.buttons(rows, {"mcp_waits": [{"server": "buffer"}]})
         self.assertEqual(got["Buffer"], ["mk-reconnect"], "reconnect stays, the login of the core is in its strip")
         self.assertEqual(got["Buffer:core"], ["waits for a login: the button is in the hub's strip"])
-        self.assertEqual(got["Mobbin"], ["mk-reconnect", "mk-login"], "not waited on by the core: as before")
+        self.assertEqual(got["Mobbin"], ["mk-reconnect"])
         self.assertNotIn("Mobbin:core", got)
 
     def test_an_older_core_snapshot_changes_nothing_in_the_view(self):
         rows = {"buffer": {"state": "lost", "title": "Buffer", "can_login": True}}
         for snap in ({}, {"mcp_waits": None}):
             got = self.buttons(rows, snap)
-            self.assertEqual(got["Buffer"], ["mk-reconnect", "mk-login"], snap)
+            self.assertEqual(got["Buffer"], ["mk-reconnect"], snap)
             self.assertNotIn("Buffer:core", got)
 
     def test_the_page_trusts_an_empty_strip_over_the_row_note(self):
-        # the process wrote core_wait a minute ago, the strip is empty now: the button is back
-        rows = {"buffer": {"state": "lost", "title": "Buffer", "core_wait": True, "can_login": True}}
+        # the process wrote core_wait a minute ago, the strip is empty now: no note
+        rows = {"buffer": {"state": "lost", "title": "Buffer", "core_wait": True}}
         got = self.buttons(rows, {"mcp_waits": []})
         self.assertNotIn("Buffer:core", got)
-        self.assertIn("mk-login", got["Buffer"])
+        self.assertEqual(got["Buffer"], ["mk-reconnect"])
 
-    def test_the_process_never_gives_an_active_row_a_login(self):
+    def test_the_process_never_gives_a_row_a_login(self):
         got = main.clean_status({"servers": {"a": {"state": "ok", "can_login": True, "can_switch": True},
                                               "b": {"state": "lost", "can_login": True}}})["servers"]
         self.assertNotIn("can_login", got["a"])
         self.assertTrue(got["a"]["can_switch"])
-        self.assertTrue(got["b"]["can_login"])
+        self.assertNotIn("can_login", got["b"])
 
 
 VIEW_ADD = """
@@ -2593,16 +2429,13 @@ class ViewAddForm(unittest.TestCase):
         got = self.run_view([], {"add": add})
         self.assertEqual(got["texts"]["mk-fail"], "Not added: this name or address is already there")
         self.assertIn("mk-add-open", got["classes"], "after a failure the owner can try again")
-        add = {"state": "done", "name": "newsvc", "at": 5, "login": {"state": "wait"}}
+        add = {"state": "done", "name": "newsvc", "at": 5}
         got = self.run_view([], {"add": add})
         self.assertEqual(got["texts"]["mk-done"], "Added: newsvc")
-        self.assertNotIn("Sessions get it", got["texts"]["mk-add-login"])
-        add["login"] = {"state": "done"}
+        self.assertEqual(got["texts"]["mk-add-login"], "Sessions get it after they restart.")
+        add["login"] = {"state": "wait"}   # a status of a version before 0.14.0: the same words, no login of ours
         got = self.run_view([], {"add": add})
         self.assertEqual(got["texts"]["mk-add-login"], "Sessions get it after they restart.")
-        add["login"] = {"state": "fail", "why": "the browser was closed"}
-        got = self.run_view([], {"add": add})
-        self.assertTrue(got["texts"]["mk-add-login"].endswith(": the browser was closed"))
 
 
 VIEW_REMOVE = VIEW_ADD.replace('c.startsWith("mk-add")', '/^mk-(del|pop|row|fail|done|busy)/.test(c)')
@@ -2693,7 +2526,8 @@ class JsStrings(unittest.TestCase):
         end = src.index("\n};", ru)
         keys = lambda part: set(re.findall(r"(\w+): \"", part))
         self.assertEqual(keys(src[en:ru]), keys(src[ru:end]))
-        self.assertTrue({"reconnect", "auto", "relogin", "switch", "ignored"} <= keys(src[en:ru]))
+        self.assertTrue({"reconnect", "switch", "ignored"} <= keys(src[en:ru]))
+        self.assertFalse({"auto", "relogin", "login", "login_wait"} & keys(src[en:ru]), "0.14.0: the login is the core's")
         self.assertNotIn("later", keys(src[en:ru]))
         self.assertFalse(re.search("[а-яА-ЯёЁ]", src[:ru] + src[end:]))
 
@@ -2804,7 +2638,7 @@ class CatalogRules(unittest.TestCase):
         with open(os.path.join(ROOT, "hub-plugin.json"), encoding="utf-8") as f:
             man = json.load(f)
         major, minor = man["hub"].lstrip("^>=~ ").split(".")[:2]
-        self.assertLessEqual((int(major), int(minor)), (1, 30))
+        self.assertLessEqual((int(major), int(minor)), (1, 36))   # the Plugin API of release 1.9.4
 
 
     def test_the_description_fits_the_catalog_limit(self):

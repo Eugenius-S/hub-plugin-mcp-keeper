@@ -15,15 +15,12 @@ servers **the hub gives to its sessions** and says so once, before a session get
   `initialize` with those headers. 401/403 - "the server rejects the headers", a failing helper - "the helper gave no
   key"; a hang or no network - "later". A leftover OAuth record of such a server is never used. The values stay in
   memory and go only to the server's own address, by the same rules as a token.
-- **No second watchdog.** The core's MCP watch already tells sessions about "needs a login" and reconnects them. The
-  plugin adds what it does not do: a stored login that a server now rejects, an erased record, a token that cannot be
-  refreshed - and tells the owner once.
-- **A core with its own login strip (Plugin API 1.31, `mcp_waits` in the snapshot).** A server that sessions wait on is
-  signed in through the strip of the hub, so for that server the plugin sends no alarm (the owner or the Hub
-  Developer), shows a grey line "waits for a login: the button is in the hub's strip" instead of **Log in**, and starts
-  neither an automatic reconnect nor `hub mcp login` while the core has a login of it open. Everything else stays: the
-  check of all servers ahead of any session, the view, duplicates, `cover`, the steps of the alarm, **Reconnect**,
-  **Another login**, **Add MCP**. A hub without that strip: the plugin works as before.
+- **No second watchdog (0.14.0).** The core (Plugin API 1.31) reconnects a failed MCP server in the sessions itself,
+  lists the servers that wait for a sign-in in its strip and signs in from there. The plugin sends no reconnect of its
+  own, has no **Log in** and starts no `hub mcp login`. It adds what the core does not do: a stored login that a server
+  now rejects, an erased record, a token that cannot be refreshed, the exact cause of an `mcp-remote` server that does
+  not start (no `--enable-proxy`) - and tells the owner once. A server the core's strip already waits on gets no alarm
+  of ours and a grey line "waits for a login: the button is in the hub's strip".
 
 ## One pass
 
@@ -80,7 +77,7 @@ the watch from what the hub gives its sessions to every MCP server of this machi
 | Microsoft 365 program | skipped: auth-keeper runs its `--verify-login` | `auth-keeper` |
 | any other stdio program | skipped, never started; the reason is in `status.json` | `program` |
 | a server on this machine (localhost) | skipped | `local` |
-| one that answers without a login | connected, no **Log in** | `none` |
+| one that answers without a login | connected | `none` |
 
 `mcp_auth_ignore` and `ignore` hold. A server under a second name (the same address or package) is checked once.
 
@@ -111,8 +108,8 @@ default**; `check_duplicates: true` sends one line per duplicate to the hub's de
   `.credentials.json`; read only). With `cover` or `check_duplicates` also `~/.claude.json`, with `cover` also
   `~/.mcp-auth`: read only.
 - **Writes:** only its own places. `status.json` next to the plugin (what the view shows), and in the plugin's own
-  folder of the hub state `state.json` (the pass state and your choice of automatic reconnect), `login.json` (the end of
-  a login you started from the view) and the switch script below. Events to the hub (a message to the owner, a line to
+  folder of the hub state `state.json` (the pass state), `login.json` (how a click in the view went) and the switch
+  script below. Events to the hub (a message to the owner, a line to
   the feed, a reconnect request, a line to a session) go through the hub's spool folder, the way every plugin process
   posts. It never writes the credential stores or another plugin's files, and its own code never writes
   `~/.claude.json` or `hub.json`. **Exception, only on your click on Add MCP or Remove (see below):** the programs it
@@ -121,8 +118,7 @@ default**; `check_duplicates: true` sends one line per duplicate to the hub's de
   uninstall` takes a plugin out of the Claude Code plugins. A short log goes to the process output, which the hub keeps in its own log.
 - **Sends:** a server's own address gets one `initialize` request with the stored token (https, or localhost; no
   redirects, see "One pass"). Nothing goes to any other address, and the plugin has no server of its own.
-- **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `hub mcp login` (only on
-  your click on **Log in**, or after **Add MCP**, and never for a server the core already waits on), `claude mcp add` and `claude mcp remove` (for the server you add: the second one takes it back if the hub refuses it;
+- **Starts programs:** `claude mcp get <server>` (a time limit, never for a one-time login), `claude mcp add` and `claude mcp remove` (for the server you add: the second one takes it back if the hub refuses it;
   and on your click on **Remove**), `claude plugin uninstall` (only on your click on **Remove**, for a plugin), `hub tools import mcp` (only after **Add MCP**), `curl` for a request through a proxy, `security` (macOS keychain read), `ps` or PowerShell
   (a list of processes, to tell who holds a lost one-time login), and the terminal below (on your click on **Another
   login**: `claude`, or the sign-out and sign-in of MS365 or Teams). A `headersHelper` runs only
@@ -142,7 +138,7 @@ default**; `check_duplicates: true` sends one line per duplicate to the hub's de
   The name is letters, digits, `-` and `_` (up to 40); the address is `https`, or `http` only for localhost, with no
   login, query or key in it. Your click posts `add <name> <address>` to the plugin's feed (only your own, fresh post
   counts, once). The process then does what you would type: `claude mcp add --transport http -s user <name> <address>`,
-  then `hub tools import mcp <name>`, then `hub mcp login` for the browser login, the same as **Log in**. A name or an
+  then `hub tools import mcp <name>`; a sign-in, if the server needs one, is in the hub's strip. A name or an
   address that is already in the hub catalog, in the hub settings or in `~/.claude.json` is refused with the reason,
   nothing is run. If the hub's settings file is busy (another process writes it), the import is tried again up to 4
   times, 5 seconds apart; if the server is in the hub catalog by then, the add counts as done. If the hub still refuses
@@ -190,15 +186,15 @@ A row says **connected**, **lost** (with the reason) or **not checked** (grey, w
 program and no stdio server: a program, or a server without a login of its own, goes by the word of the running sessions
 (sessions report it connected - connected, waits for a login - lost, no word - "not checked"). A server in `mcp_auth_ignore` (hub.json) is not
 followed: it sits in one grey line under the table, with no buttons and no alarms. When a pass gets no clear answer (a
-timeout, no network to the server), it asks again up to 3 times with a pause, reconnecting the server in the sessions in
-between; still no answer - the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward
+timeout, no network to the server), it asks again up to 3 times with a pause; still no answer - the row is "lost: no clear answer after 4 checks", with no alarm (it does not count toward
 one).
 
 A stdio server with `mcp-remote` that the running sessions could not start ("Connection closed", a connect timeout) gets
 its cause named instead of "needs a login": the machine has a proxy but the args have no `--enable-proxy` (mcp-remote then
 ignores the proxy and times out) - one exact line to the Hub Developer with the fix, no alarm to the owner, no pointless
 reconnect; no stored login in `~/.mcp-auth` - the usual "never logged in / erased" row; the login and the flag are in
-place - the server is reconnected by itself (this is how a login that appeared later is taken in without the owner).
+place - no alarm, the core reconnects the server itself (this is how a login that appeared later is taken in without the
+owner).
 
 Buttons of a row:
 
@@ -214,13 +210,9 @@ Buttons of a row:
   this would replace the terminal. The row says "terminal opened" or why it did not open.
 - **no account** (grey words, no button) - a connected server without any account: a local program with no key, public
   docs.
-- **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the hub reconnects the server in every running
-  session that has it (the event `mcp.reconnect`, needs a hub with `hub mcp reconnect`), then the plugin checks the
+- **Reconnect** - on a lost server, no login: posts `reconnect <server>`; the plugin asks the core
+  (`mcp.reconnect_requested`) to reconnect the server in the running sessions where it failed or waits, then checks the
   server again at once and the row shows the result.
-- **Log in** / **Log in again** - only for a lost server or one nobody logged in yet (a connected one has only "Another login"), and only for a server that logs in in a browser: posts `login <server>`; the process runs
-  the same `hub mcp login <session> <server>` you would type in a terminal (a running session that has the server, else
-  the hub's own) and your browser opens the login. The row says "login opened in the browser" until the hub reports the
-  end, then the result (done, or why not); a login that went through makes the next check start at once.
 
 - **Delete** (the trash icon in a narrow column at the right edge of the row) - only on a server that lives on this machine outside the hub catalog: a server you added to Claude Code
   yourself (`~/.claude.json`, user scope), or a server of a Claude Code plugin. A click opens a small question
@@ -233,9 +225,7 @@ Buttons of a row:
   read-only `conduit` and a server of a project block have no button: the plugin does not write `hub.json`. Nothing
   is deleted from disk besides what Claude Code itself removes; no login is touched.
 
-The box **Reconnect automatically** under the table (on by default; your choice is kept in `state.json`): at the start
-and on every pass a lost server is reconnected, at most once in 10 minutes per server, with a line in the
-log. A one-time login (`one_time`) is never reconnected. Only your own posts count, only for a server in the table.
+There is no **Log in** and no **Reconnect automatically** box any more (0.14.0): the core reconnects and signs in itself.
 
 Run one pass by hand: `PYTHONPATH=<hub code> python3 main.py --once`.
 
@@ -254,12 +244,13 @@ Mobbin, Higgsfield, Granola, GitHub, MS365, Canva. Машинное имя ле�
 аккаунт). MS365 и Teams: программа сервера выходит и входит заново (код устройства). Сервер с ключом (Grafana и
 подобные): только слова, где в сервисе взять новый ключ и что сказать хабу («смени ключ Grafana»). У сервера без
 аккаунта (локальная программа без ключа, публичные доки) кнопки нет, в строке серым «без аккаунта».
-Если у ядра хаба есть своя полоса «MCP ждёт входа» (Plugin API 1.31), сервером из неё занимается она: по такому серверу
-плагин не шлёт тревог, вместо **Войти** показывает серую строку «ждёт входа — кнопка в полосе хаба» и не запускает
-автопереподключение и `hub mcp login`, пока у ядра идёт вход. Остальное работает как раньше. Хаб без такой полосы: плагин
-ведёт себя как прежде.
+С 0.14.0 переподключение и вход делает ядро хаба (Plugin API 1.31): оно само переподключает упавший MCP в сессиях,
+показывает в своей полосе серверы, которые ждут входа, и входит оттуда. Плагин своих переподключений не шлёт, кнопки
+**Войти** и галочки «Автопереподключение» у него нет. По серверу из полосы ядра плагин не шлёт тревог и пишет серым «ждёт
+входа: кнопка в полосе хаба». За плагином остались ранняя проверка сохранённых входов и точная причина у `mcp-remote` без
+`--enable-proxy`.
 Сам плагин подключённый вход не переключает: хранилище входов Claude Code ему писать нельзя, ключ он не читает и не
-пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопки **Переподключить** и **Войти**, у подключённого только **Другой логин**. Подробнее выше, в разделе про вид.
+пишет, а `claude mcp logout` стирает вход. У отвалившегося и ещё не входившего сервера кнопка **Переподключить** (просит ядро), у подключённого только **Другой логин**. Подробнее выше, в разделе про вид.
 
 Что плагин читает, пишет и куда шлёт: читает `hub.json`, состояние хаба и сохранённые входы MCP Claude Code (только
 чтение); пишет только в свои места (`status.json` рядом с плагином, `state.json`, `login.json` и скрипт ниже в своей папке
@@ -285,7 +276,7 @@ Esc, «Отмена» или клик в сторону закрывают ег�
 Под таблицей кнопка **Добавить MCP**: название (буквы, цифры, `-`, `_`, до 40 знаков) и адрес, который даёт сам сервис
 (`https`, `http` только для localhost, без логина, параметров и ключа). Клик кладёт в ленту плагина `add <название>
 <адрес>` (считается только ваш свежий пост, один раз). Процесс делает то же, что набрали бы вы: `claude mcp add --transport
-http -s user`, затем `hub tools import mcp`, затем `hub mcp login` для входа в браузере, как у кнопки **Войти**. Название или
+http -s user`, затем `hub tools import mcp`; вход, если он нужен, в полосе хаба. Название или
 адрес, которые уже есть в каталоге хаба, настройках хаба или `~/.claude.json`, отклоняются с причиной, ничего не
 запускается. Если файл настроек хаба занят (его пишет другой процесс), импорт повторяется до 4 раз с паузой 5 секунд; если
 к этому времени сервер уже в каталоге хаба, добавление считается сделанным. Если хаб всё же не принял запись, `claude mcp remove` её

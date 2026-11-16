@@ -7,16 +7,13 @@ const STR = {
     none: "No pass yet: the first one goes a minute after the start, after a calm network.",
     ok: "connected", lost: "lost", first: "never logged in", never: "never",
     skip: "not checked", by: "Held by",
-    login: "Log in", relogin: "Log in again", login_wait: "login… opened in the browser",
-    login_done: "logged in, checking", login_fail: "login did not go through", login_sent: "asking the hub…",
     reconnect: "Reconnect", reconnect_sent: "reconnecting…", reconnect_done: "reconnected",
-    reconnect_fail: "did not come back", auto: "Reconnect automatically",
-    auto_hint: "a lost server reconnects in the running sessions by itself, at most once in 10 min",
+    reconnect_fail: "did not come back",
     switch: "Another login", no_account: "no account", switch_sent: "opening a terminal…",
     switch_done: "terminal opened: follow the steps in it", switch_fail: "the terminal did not open",
     ignored: "Not followed", core_login: "waits for a login: the button is in the hub's strip",
     add: "Add MCP", add_name: "Name", add_url: "Address, https://…", add_go: "Add", add_cancel: "Cancel",
-    add_hint: "The service gives the name and the address. A key is not typed here: you log in in the browser.",
+    add_hint: "The service gives the name and the address. A key is not typed here: the login is in the hub's strip.",
     add_bad: "Check the name (letters, digits, - and _) and the address (https, no key or parameters in it)",
     add_sent: "adding…", add_ok: "Added: {name}", add_fail: "Not added", add_restart: "Sessions get it after they restart.",
     remove: "Delete", remove_q: "Delete {name}?", remove_plugin: "The whole plugin goes, with its skills.",
@@ -29,16 +26,13 @@ const STR = {
     none: "Проверки ещё не было: первая пройдёт через минуту после старта, при спокойной сети.",
     ok: "подключён", lost: "отвалился", first: "ещё не входили", never: "никогда",
     skip: "не проверяется", by: "Кто держит",
-    login: "Войти", relogin: "Войти заново", login_wait: "вход… открыт в браузере",
-    login_done: "вошли, проверяю", login_fail: "вход не прошёл", login_sent: "прошу хаб…",
     reconnect: "Переподключить", reconnect_sent: "переподключаю…", reconnect_done: "переподключено",
-    reconnect_fail: "не ожил", auto: "Автопереподключение",
-    auto_hint: "отвалившийся сервер сам переподключается в работающих сессиях, не чаще раза в 10 мин",
+    reconnect_fail: "не ожил",
     switch: "Другой логин", no_account: "без аккаунта", switch_sent: "открываю терминал…",
     switch_done: "терминал открыт: дальше по шагам в нём", switch_fail: "терминал не открылся",
     ignored: "Не следим", core_login: "ждёт входа — кнопка в полосе хаба",
     add: "Добавить MCP", add_name: "Название", add_url: "Адрес, https://…", add_go: "Добавить", add_cancel: "Отмена",
-    add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь в браузере.",
+    add_hint: "Название и адрес даёт сам сервис. Ключ тут не вводится: войдёшь через полосу хаба.",
     add_bad: "Проверь название (буквы, цифры, - и _) и адрес (https, без ключа и параметров)",
     add_sent: "добавляю…", add_ok: "Добавлено: {name}", add_fail: "Не добавлено", add_restart: "Сессии получат его после перезапуска.",
     remove: "Удалить", remove_q: "Удалить {name}?", remove_plugin: "Удалится плагин целиком, с его скиллами.",
@@ -91,12 +85,10 @@ function when(sec) {
   return new Date(sec * 1000).toLocaleString(hub.lang, { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-// a login is open: the process writes its end to status.json, the view looks more often until then
+// a click waits for the process: it writes the end to status.json, the view looks more often until then
 function waiting() {
   const rows = Object.entries((last.data && last.data.servers) || {});
-  const add = (last.data && last.data.add) || {};
-  return rows.some(([n, r]) => (r.login && ["wait", "sent"].includes(r.login.state)) || mine(n)) || adding() ||
-    (add.login && add.login.state === "wait");
+  return rows.some(([n, r]) => (r.login && r.login.state === "sent") || mine(n)) || adding();
 }
 
 // the click on "Add" is waiting for the process: its answer (data.add) is newer than the click
@@ -119,7 +111,7 @@ async function load(snap, force = false) {
 }
 
 // A core that has its own "MCP waits for a login" strip (Plugin API 1.31) puts mcp_waits in the snapshot; an older one
-// has no such key, and the view works as before. A server in that list is signed in through the strip: no "Log in" here.
+// has no such key, and the row's core_wait says the same. A server in that list is signed in through the strip.
 function coreWaits(snap) {
   return snap && Array.isArray(snap.mcp_waits) ? new Set(snap.mcp_waits.map((w) => w && w.server)) : null;
 }
@@ -148,8 +140,8 @@ function button(cls, label, text, name, act, td) {
 }
 
 // The actions of a row: "Another login" for a connected server with a login of its own (the process opens a
-// terminal where the login is changed), "Reconnect" (the server reconnects in every running session, no login) for a lost
-// one, "Log in" / "Log in again" (the process runs `hub mcp login`) where a login can help; or what is going on now.
+// terminal where the login is changed), "Reconnect" for a lost one (the core reconnects it in the running sessions);
+// a server that waits for a login says the button is in the hub's strip (the core signs in); or what is going on now.
 // "Delete": a trash in a narrow column of its own; the click opens a popover (a plugin goes whole, with its skills), "Delete"
 // posts "remove <server>"; the process runs the Claude Code command and says how it went in data.remove. Servers of the
 // hub's catalog have no trash.
@@ -217,23 +209,19 @@ function actionCell(row, name, s) {
   const l = s.login || {};
   const re = l.act === "reconnect";
   const sw = l.act === "switch";
-  const busy = (re && l.state === "sent") || (!re && !sw && l.state === "wait");
+  const busy = re && l.state === "sent";
   const rm = (last.data && last.data.remove) || {};
   const asked = sent[name] && mine(name) && (sent[name].act === "remove" ? removing(name) :
-    !(l.at && l.at * 1000 >= sent[name].at && l.state !== "sent" && l.state !== "wait"));
+    !(l.at && l.at * 1000 >= sent[name].at && l.state !== "sent"));
   if (busy || asked) {
-    const act = asked ? sent[name].act : re ? "reconnect" : "login";
-    const text = tr(act === "remove" ? "remove_sent" : act === "reconnect" ? "reconnect_sent" : act === "switch" ? "switch_sent" : l.state === "wait" ? "login_wait" : "login_sent");
+    const act = asked ? sent[name].act : "reconnect";
+    const text = tr(act === "remove" ? "remove_sent" : act === "switch" ? "switch_sent" : "reconnect_sent");
     td.append(hub.el("span", "mk-busy", text));
     return;
   }
-  if (l.state === "done" && !re && !sw && !s.can_login) {
-    td.textContent = tr("login_done");
-    return;
-  }
-  if (l.state === "fail" || (l.state === "done" && (re || sw))) {
+  if ((re || sw) && (l.state === "fail" || l.state === "done")) {
     const ok = l.state === "done";
-    const key = re ? (ok ? "reconnect_done" : "reconnect_fail") : sw ? (ok ? "switch_done" : "switch_fail") : "login_fail";
+    const key = re ? (ok ? "reconnect_done" : "reconnect_fail") : ok ? "switch_done" : "switch_fail";
     const msg = hub.el("div", ok ? "mk-done" : "mk-fail", tr(key) + (l.why && !ok ? ": " + l.why : ""));
     msg.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-bottom:4px;white-space:normal";
     td.append(msg);
@@ -248,7 +236,6 @@ function actionCell(row, name, s) {
   if (s.can_switch) bar.append(button("mk-switch", "switch", "switch_sent", name, "switch", td));
   else if (s.state !== "skip" && s.state !== "ok") bar.append(button("mk-reconnect", "reconnect", "reconnect_sent", name, "reconnect", td));
   const core = s.state !== "ok" && s.state !== "skip" && coreWaiting(name, s);   // the hub's strip has this login
-  if (s.can_login && s.state !== "ok" && !core) bar.append(button("mk-login", s.state === "lost" ? "relogin" : "login", "login_sent", name, "login", td));
   if (core) {
     const hint = hub.el("span", "mk-core", tr("core_login"));
     hint.style.cssText = "opacity:.7;font-size:.9em;align-self:center";
@@ -263,7 +250,7 @@ function actionCell(row, name, s) {
 }
 
 // "Add MCP" under the table: a name and an address (https). The click posts "add <name> <address>"; the process adds the
-// server the hub's own way, opens the login, and says how it went in data.add.
+// server the hub's own way and says how it went in data.add. A login, if it needs one, is in the hub's strip.
 function addBox(d) {
   const wrap = hub.el("div", "mk-add");
   wrap.style.cssText = "margin-top:14px";
@@ -278,9 +265,7 @@ function addBox(d) {
     line.style.cssText = "color:" + (ok ? COLOR.ok : COLOR.lost) + ";font-size:.9em;margin-bottom:6px;white-space:normal";
     wrap.append(line);
     if (ok) {
-      const l = add.login || {};
-      const text = l.state === "wait" ? tr("login_wait") : l.state === "fail" ? tr("login_fail") + (l.why ? ": " + l.why : "") : tr("add_restart");
-      const note = hub.el("div", "mk-add-login", text);
+      const note = hub.el("div", "mk-add-login", tr("add_restart"));
       note.style.cssText = "font-size:.9em;opacity:.8;margin-bottom:6px;white-space:normal";
       wrap.append(note);
     }
@@ -338,24 +323,6 @@ function removedLine(d) {
   return line;
 }
 
-function autoBox(d) {
-  const label = hub.el("label", "mk-auto");
-  label.style.cssText = "display:flex;gap:8px;align-items:center;margin-top:14px;cursor:pointer";
-  const box = hub.el("input");
-  box.type = "checkbox";
-  box.checked = d.auto !== false;
-  box.onchange = () => {
-    d.auto = box.checked;
-    hub.postFeed(box.checked ? "auto on" : "auto off");   // the process keeps the choice in its state
-  };
-  label.append(box, hub.el("span", "", tr("auto")));
-  const hint = hub.el("p", "mk-hint", tr("auto_hint"));
-  hint.style.cssText = "margin:4px 0 0 26px;opacity:.7;font-size:.9em";
-  const wrap = hub.el("div");
-  wrap.append(label, hint);
-  return wrap;
-}
-
 let root_ = null;
 
 // the row of a server that was "deleting…" and is gone from the table now: its last picture fades out (240 ms, ease-out)
@@ -405,7 +372,7 @@ function draw(root) {
     head.append(th);
   }
   const rmFail = (name) => d.remove && d.remove.state === "fail" && d.remove.name === name;   // the failure of a deletion is told in the row
-  const acts = (s, name) => rmFail(name) || removing(name) || s.can_switch || s.no_account || (s.can_login && s.state !== "ok") || s.login || (s.state !== "skip" && s.state !== "ok");
+  const acts = (s, name) => rmFail(name) || removing(name) || s.can_switch || s.no_account || s.login || (s.state !== "skip" && s.state !== "ok");
   const withActs = shown.some(([n, s]) => acts(s, n));
   if (withActs) head.append(hub.el("th"));
   const withDel = shown.some(([, s]) => s.can_remove);
@@ -444,7 +411,6 @@ function draw(root) {
   }
   wrap.append(removedLine(d));
   wrap.append(addBox(d));
-  wrap.append(autoBox(d));
   root.append(wrap);
   if (focusAfter) {
     focusAfter = "";
