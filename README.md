@@ -25,7 +25,10 @@ servers **the hub gives to its sessions** and says so once, before a session get
 ## One pass
 
 1. The stored access token (Claude Code credentials: the macOS keychain item or `.credentials.json`, read only, never
-   written) goes in an `initialize` request to the server's own address. 401/403 - the login is rejected. The token
+   written) goes in an `initialize` request to the server's own address. 401/403 - the login is rejected. The token's
+   end is read by the clock, not by the time the pass started (0.14.1): a pass on a slow network takes minutes, and an
+   access that ran out meanwhile is not sent. A 401/403 to an access that has a refresh token and ends within 5 minutes
+   is its end, not a loss: it goes the way of an expired one (step 2). The token
    goes only to https (http - only to localhost / 127.0.0.1), never to an address with a login in it, never to an
    address other than the one the login was stored for, and a redirect is not followed (the Authorization header
    would travel with it): a 3xx answer is "later".

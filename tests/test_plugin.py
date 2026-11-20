@@ -1060,6 +1060,38 @@ class Cover(Base):
         write(os.path.join(TMP, "mcp-auth", "mcp-remote-v1", hashlib.md5(self.REMOTE.encode()).hexdigest() + "_tokens.json"),
               {"access_token": access, "refresh_token": refresh, "expires_at": expires * 1000})
 
+    def ending(self, name, expires):
+        recs = read(os.environ["MCP_KEEPER_CREDS"])
+        recs["mcpOAuth"][name + "|abc"]["expiresAt"] = expires * 1000
+        write(os.environ["MCP_KEEPER_CREDS"], recs)
+        self.reject(name)   # the server refuses the access it is sent, every time
+
+    def test_access_that_ran_out_during_a_slow_pass_is_refreshed_not_lost(self):
+        # a replay: the network was down, the pass with its retries took minutes; its `now` lags the clock, and an
+        # access that ran out meanwhile still looked live by it - the dead access was sent, 401 twice, "lost"
+        self.ending("figma", NOW + 150)
+        with mock.patch.object(main.time, "time", lambda: NOW + 180):
+            res = self.run_once(NOW)
+        self.assertEqual(res["servers"]["figma"]["state"], "ok")   # Claude Code refreshed it
+        self.assertEqual(self.asked, ["figma"])
+        self.assertNotIn("figma", json.dumps(self.notes() + self.dev()))
+
+    def test_access_refused_at_its_very_end_goes_the_refresh_way(self):
+        self.ending("figma", NOW + 200)   # live by the clock, yet ends within minutes: a 401 is its end, not a loss
+        with mock.patch.object(main.time, "time", lambda: NOW + 100):
+            res = self.run_once(NOW)
+        self.assertEqual(res["servers"]["figma"]["state"], "ok")
+        self.assertEqual(self.asked, ["figma"])
+        self.assertNotIn("figma", json.dumps(self.notes() + self.dev()))
+
+    def test_live_access_refused_is_still_lost(self):
+        self.ending("figma", NOW + 3600)
+        with mock.patch.object(main.time, "time", lambda: NOW + 180):
+            res = self.run_once(NOW)
+        self.assertEqual(res["servers"]["figma"]["state"], "lost")
+        self.assertIn("HTTP 401", res["servers"]["figma"]["why"])
+        self.assertEqual(self.asked, [], "a live access refused is not asked of claude")
+
     def test_off_by_default(self):
         self.config({})
         res = self.run_once()
@@ -2226,7 +2258,7 @@ class CoreDoesIt(Base):
 class Manifest(unittest.TestCase):
     def test_version_and_wording(self):
         m = read(os.path.join(ROOT, "hub-plugin.json"))
-        self.assertEqual(m["version"], "0.14.0")
+        self.assertEqual(m["version"], "0.14.1")
         self.assertEqual(m["hub"], "^1.31")   # the core's mcpwatch: reconnect, strip, sign-in
         text = json.dumps(m, ensure_ascii=False).lower()
         self.assertNotIn("live", text.replace("deliver", ""))

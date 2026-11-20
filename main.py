@@ -84,6 +84,7 @@ TRIES = 3
 RETRIES = 3               # a server the pass could not judge is asked again this many times before it shows as lost
 RETRY_PAUSE = 20          # seconds between those tries
 REJECT_PAUSE = 60         # a 401/403 is asked again after this many seconds (credentials read anew) before it is a loss
+ENDING = 300              # an access with a refresh token refused this close to its end is taken as expired, not lost
 RECONNECT_WAIT = 15       # a reconnect from the view: the sessions take it in, then this one server is checked again
 RECHECK_ASYNC = True      # tests: the check after a click runs in the same thread
 LOCK = threading.Lock()   # one pass at a time: the loop and the check after a click write the same state
@@ -1116,14 +1117,19 @@ def checkup(conf, now, st, hub, hub_st, only=None):
             continue
         expires = (ent.get("expiresAt") or 0) / 1000
         row = {"state": "later"}
-        if ent.get("accessToken") and (not expires or expires > now + 60):
+        fresh = bool(ent.get("accessToken")) and alive(expires, now)
+        if fresh:
             # the stored login of another address (a name that two servers share) never gets sent to this one
             ok, code = probe({**ent, "serverUrl": ent.get("serverUrl") or url}) if same_server(ent.get("serverUrl"), url) \
                 else (None, None)
-            if ok is False:
+            if ok is False and ent.get("refreshToken") and ending(expires, now):
+                fresh = False   # refused at its very end: it ran out meanwhile - the refresh way, as an expired one
+            elif ok is False:
                 row = {**lose(tr("why_rejected", code=code)), "rejected": True}
             elif ok:
                 row = {"state": "ok"}
+        if fresh:
+            pass   # the server's own answer is the row
         elif ent.get("refreshToken"):
             said = ask(name, ent, now, st, conf, url)
             if said in ("unknown", "later") and not (short(name) in conf["one_time"] and said == "later" and
@@ -1139,7 +1145,7 @@ def checkup(conf, now, st, hub, hub_st, only=None):
                 row = {"state": "later", "why": tr("why_stale", days=int(days))}
         else:
             row = lose(tr("why_expired"))
-        if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - now < conf["warn_days"] * DAY:
+        if row["state"] == "ok" and expires and not ent.get("refreshToken") and expires - wall(now) < conf["warn_days"] * DAY:
             row = lose(tr("why_expires", day=time.strftime("%d.%m", time.localtime(expires))))
         out[name] = {**row, "by": by} if cover else row
     for name, srv in sorted(header_servers(cover).items()):
@@ -1193,14 +1199,32 @@ def rest(conf, out, hub, hub_st, only=None, had=()):
             out[name] = {"state": "skip", "why": tr("why_no_word_program" if program else "why_no_word")}
 
 
+def wall(now):
+    """The clock a token's end is read by. A pass hands down `now` of its start plus the pauses it planned, while its
+    probes on a slow network take far longer: an access that ran out meanwhile looked live by that `now`, the dead one
+    was sent and refused (401) - a false loss. In a live pass `now` is never ahead of the clock; tests run in the future."""
+    return max(now, time.time())
+
+
+def alive(expires, now):
+    """An access is sent only while it has a minute left by the clock (no end known: live)."""
+    return not expires or expires > wall(now) + 60
+
+
+def ending(expires, now):
+    """A 401/403 to an access this close to its end is its end, not a loss: the refresh token is the way."""
+    return bool(expires) and expires - wall(now) < ENDING
+
+
 def read_only_row(ent, now, lose):
     """A login another part of the hub refreshes (conduit): a live access is asked of the server, an expired one with a
     refresh token is the normal state between uses - never asked of claude, never refreshed here."""
     expires = (ent.get("expiresAt") or 0) / 1000
-    if ent.get("accessToken") and (not expires or expires > now + 60):
+    if ent.get("accessToken") and alive(expires, now):
         ok, code = probe(ent)
-        return ({**lose(tr("why_rejected", code=code)), "rejected": True} if ok is False else
-                {"state": "ok", "by": "conduit"} if ok else {"state": "later", "by": "conduit"})
+        if not (ok is False and ent.get("refreshToken") and ending(expires, now)):   # refused at its end: expired
+            return ({**lose(tr("why_rejected", code=code)), "rejected": True} if ok is False else
+                    {"state": "ok", "by": "conduit"} if ok else {"state": "later", "by": "conduit"})
     if ent.get("refreshToken"):
         return {"state": "skip", "why": tr("why_read_only"), "by": "conduit"}
     return lose(tr("why_expired"))
@@ -1225,11 +1249,13 @@ def programs(conf, now, out, logged, had, hub, catalog, only=None, hub_st=None):
                              else {"state": "first", "why": tr("why_first"), "fix": fix, "by": holder})
                 continue
             logged.append(name)
-            if tok["access"] and (not tok["expires"] or tok["expires"] > now + 60):
+            if tok["access"] and alive(tok["expires"], now):
                 ok, code = probe_with(url, {"Authorization": "Bearer " + tok["access"]})
-                out[name] = ({"state": "lost", "why": tr("why_rejected", code=code), "fix": fix, "by": holder,
-                              "rejected": True} if ok is False else {"state": "ok" if ok else "later", "by": holder})
-            elif tok["refresh"] and conf["auth_keeper"]:   # it refreshes 2 h ahead: expired means it did not
+                if not (ok is False and tok["refresh"] and ending(tok["expires"], now)):   # refused at its end: expired
+                    out[name] = ({"state": "lost", "why": tr("why_rejected", code=code), "fix": fix, "by": holder,
+                                  "rejected": True} if ok is False else {"state": "ok" if ok else "later", "by": holder})
+                    continue
+            if tok["refresh"] and conf["auth_keeper"]:   # it refreshes 2 h ahead: expired means it did not
                 out[name] = {"state": "lost", "why": tr("why_remote_expired"), "fix": fix, "by": holder}
             elif tok["refresh"]:
                 out[name] = {"state": "skip", "why": tr("why_remote_later"), "by": holder}
